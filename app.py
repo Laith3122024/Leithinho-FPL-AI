@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-Laithinho FPL AI V5.3
+Laithinho FPL AI V6.0
 نسخة عربية متكاملة — إصلاح أخطاء البيانات التاريخية:
 - بيانات FPL الحالية
 - آخر الجولات
@@ -15,11 +15,10 @@ Laithinho FPL AI V5.3
 - مستشار الكابتن والـChips
 - أخبار اللاعب
 - واجهة محادثة عربية
-- جاهزة لاحقًا لطبقة Machine Learning حقيقية
+- تتضمن الآن طبقة Machine Learning حقيقية مع Backtesting
 
 ملاحظة:
-الموسم الحالي 2026/27 يبدأ ببيانات تمهيدية، لذلك النموذج يعطي أولوية للبيانات الحالية عندما تتوفر،
-ويستخدم 2025/26 و2024/25 كتاريخ مرجعي.
+الموسم الحالي 2026/27 بدأ بالفعل؛ GW1 تدخل كبيانات حديثة، بينما المواسم السابقة تُستخدم للتعلم والتوقع.
 """
 
 import html
@@ -33,6 +32,9 @@ import pulp
 import requests
 import streamlit as st
 from PIL import Image
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error
+from sklearn.impute import SimpleImputer
 
 # ============================================================
 # إعداد الصفحة
@@ -420,6 +422,198 @@ def risk_label(x):
         return "🟡 مخاطرة قرار متوسطة"
     return "🟢 مخاطرة قرار منخفضة"
 
+
+# ============================================================
+# V6.0 — Machine Learning Prediction Engine
+# ============================================================
+# هذا نموذج ML فعلي: يتعلم من صفوف تاريخية "قبل الجولة" ويتنبأ
+# بالنقاط الفعلية للجولة التالية. لا نستخدم نقاط نفس الجولة كمدخل.
+ML_FEATURES = [
+    "ml_prev_points", "ml_roll3_points", "ml_roll5_points",
+    "ml_prev_minutes", "ml_roll5_minutes", "ml_prev_starts",
+    "ml_prev_goals", "ml_prev_assists", "ml_prev_xgi",
+    "ml_prev_bonus", "ml_prev_bps", "ml_prev_ict",
+    "ml_season_ppg", "ml_price", "ml_position", "ml_home",
+]
+
+def _first_existing(frame, names, default=0):
+    for n in names:
+        if n in frame.columns:
+            return pd.to_numeric(frame[n], errors="coerce").fillna(default)
+    return pd.Series(default, index=frame.index, dtype=float)
+
+@st.cache_data(ttl=21600)
+def build_ml_training_data(history_df):
+    if history_df is None or history_df.empty:
+        return pd.DataFrame()
+
+    h = history_df.copy()
+    required = {"name", "GW", "total_points"}
+    if not required.issubset(h.columns):
+        return pd.DataFrame()
+
+    h["GW"] = pd.to_numeric(h["GW"], errors="coerce")
+    h["total_points"] = pd.to_numeric(h["total_points"], errors="coerce").fillna(0)
+    h = h.dropna(subset=["name", "GW"]).copy()
+    h["name"] = h["name"].astype(str).str.strip()
+
+    # season + player + GW = chronological order.
+    sort_cols = [c for c in ["name", "الموسم", "GW"] if c in h.columns]
+    h = h.sort_values(sort_cols).copy()
+
+    numeric_sources = {
+        "minutes": ["minutes"],
+        "starts": ["starts"],
+        "goals": ["goals_scored"],
+        "assists": ["assists"],
+        "xgi": ["expected_goal_involvements"],
+        "bonus": ["bonus"],
+        "bps": ["bps"],
+        "ict": ["ict_index"],
+        "ppg": ["points_per_game"],
+        "price": ["value", "now_cost"],
+        "position": ["element_type"],
+        "home": ["was_home"],
+    }
+
+    for key, names in numeric_sources.items():
+        h[f"__{key}"] = _first_existing(h, names)
+
+    g = h.groupby(["name"] + (["الموسم"] if "الموسم" in h.columns else []), sort=False)
+
+    # All rolling features are shifted first: no future leakage.
+    for key in ["minutes", "starts", "goals", "assists", "xgi", "bonus", "bps", "ict"]:
+        prev = g[f"__{key}"].shift(1)
+        h[f"ml_prev_{key}"] = prev
+        group_series = [h["name"]] + ([h["الموسم"]] if "الموسم" in h.columns else [])
+        h[f"ml_roll5_{key}"] = prev.groupby(group_series, sort=False).transform(
+            lambda s: s.rolling(5, min_periods=1).mean()
+        )
+
+    prev_points = g["total_points"].shift(1)
+    h["ml_prev_points"] = prev_points
+    group_keys = ["name"] + (["الموسم"] if "الموسم" in h.columns else [])
+    h["ml_roll3_points"] = prev_points.groupby(
+        [h[k] for k in group_keys], sort=False
+    ).transform(lambda s: s.rolling(3, min_periods=1).mean())
+    h["ml_roll5_points"] = prev_points.groupby(
+        [h[k] for k in group_keys], sort=False
+    ).transform(lambda s: s.rolling(5, min_periods=1).mean())
+    h["ml_roll5_minutes"] = h["ml_prev_minutes"].groupby(
+        [h[k] for k in group_keys], sort=False
+    ).transform(lambda s: s.rolling(5, min_periods=1).mean())
+
+    h["ml_season_ppg"] = h["__ppg"].shift(1).fillna(0)
+    h["ml_price"] = h["__price"].shift(1).fillna(0)
+    h["ml_position"] = h["__position"].fillna(0)
+    h["ml_home"] = h["__home"].fillna(0).astype(float)
+
+    # Remove rows where we have no previous information at all.
+    h = h[h["ml_prev_points"].notna()].copy()
+    h = h.replace([np.inf, -np.inf], np.nan)
+    return h[ML_FEATURES + ["total_points", "الموسم", "GW", "name"]].copy()
+
+@st.cache_resource(ttl=21600)
+def train_ml_model(history_df):
+    train = build_ml_training_data(history_df)
+    if train.empty or len(train) < 200:
+        return None, {"trained": False, "rows": len(train)}
+
+    # Time-aware validation: train on the older season, validate on the newer one.
+    seasons = sorted(train["الموسم"].dropna().unique()) if "الموسم" in train.columns else []
+    if len(seasons) >= 2:
+        train_part = train[train["الموسم"] == seasons[0]].copy()
+        valid_part = train[train["الموسم"] == seasons[-1]].copy()
+    else:
+        cutoff = train["GW"].quantile(.8)
+        train_part = train[train["GW"] <= cutoff].copy()
+        valid_part = train[train["GW"] > cutoff].copy()
+
+    X_train = train_part[ML_FEATURES]
+    y_train = train_part["total_points"]
+    X_valid = valid_part[ML_FEATURES]
+    y_valid = valid_part["total_points"]
+
+    imputer = SimpleImputer(strategy="median")
+    X_train_i = imputer.fit_transform(X_train)
+    X_valid_i = imputer.transform(X_valid)
+
+    model = HistGradientBoostingRegressor(
+        max_iter=250,
+        learning_rate=0.045,
+        max_leaf_nodes=24,
+        l2_regularization=1.5,
+        random_state=42,
+    )
+    model.fit(X_train_i, y_train)
+
+    mae = mean_absolute_error(y_valid, model.predict(X_valid_i)) if len(valid_part) else None
+
+    # Final production model learns from ALL historical rows.
+    X_all = imputer.fit_transform(train[ML_FEATURES])
+    final_model = HistGradientBoostingRegressor(
+        max_iter=300,
+        learning_rate=0.04,
+        max_leaf_nodes=24,
+        l2_regularization=1.5,
+        random_state=42,
+    )
+    final_model.fit(X_all, train["total_points"])
+
+    return (final_model, imputer), {
+        "trained": True,
+        "rows": len(train),
+        "validation_rows": len(valid_part),
+        "mae": float(mae) if mae is not None else None,
+        "seasons": [str(s) for s in seasons],
+    }
+
+# Current-season features. With only GW1 available, the model gets GW1 as
+# recent information and the historical columns above provide the longer memory.
+def make_current_ml_features(frame):
+    out = pd.DataFrame(index=frame.index)
+    out["ml_prev_points"] = num(frame.get("total_points", 0))
+    out["ml_roll3_points"] = num(frame.get("total_points", 0))
+    out["ml_roll5_points"] = num(frame.get("total_points", 0))
+    out["ml_prev_minutes"] = num(frame.get("minutes", 0))
+    out["ml_roll5_minutes"] = num(frame.get("minutes", 0))
+    out["ml_prev_starts"] = num(frame.get("starts", 0))
+    out["ml_prev_goals"] = num(frame.get("goals_scored", 0))
+    out["ml_prev_assists"] = num(frame.get("assists", 0))
+    out["ml_prev_xgi"] = num(frame.get("expected_goal_involvements", 0))
+    out["ml_prev_bonus"] = num(frame.get("bonus", 0))
+    out["ml_prev_bps"] = num(frame.get("bps", 0))
+    out["ml_prev_ict"] = num(frame.get("ict_index", 0))
+    out["ml_season_ppg"] = num(frame.get("points_per_game", 0))
+    out["ml_price"] = num(frame.get("price", 0))
+    out["ml_position"] = num(frame.get("element_type", 0))
+    out["ml_home"] = 0.0
+
+    # Next fixture: home/away is known before kickoff and is safe to use.
+    for i, (_, row) in enumerate(frame.iterrows()):
+        fs = upcoming(row["team"], horizon=1)
+        if fs:
+            out.loc[row.name, "ml_home"] = 1.0 if fs[0]["home"] else 0.0
+    return out[ML_FEATURES]
+
+with st.spinner("جاري تدريب محرك التوقعات ML على المواسم السابقة..."):
+    ml_bundle, ml_info = train_ml_model(history)
+
+if ml_bundle is not None:
+    ml_model, ml_imputer = ml_bundle
+    ml_features_now = make_current_ml_features(df)
+    ml_pred = ml_model.predict(ml_imputer.transform(ml_features_now))
+    # Blend ML with the deterministic engine rather than blindly trusting one model.
+    df["توقع_ML"] = np.clip(ml_pred, 0.0, 15.0)
+    df["النقاط_المتوقعة_قبل_ML"] = df["النقاط_المتوقعة"]
+    df["النقاط_المتوقعة"] = (
+        0.65 * df["النقاط_المتوقعة_قبل_ML"] +
+        0.35 * df["توقع_ML"]
+    ).clip(.2, 15)
+else:
+    df["توقع_ML"] = np.nan
+    ml_info = {"trained": False, "rows": 0, "mae": None, "seasons": []}
+
 # ============================================================
 # تحسين الفريق
 # ============================================================
@@ -658,6 +852,7 @@ tabs = st.tabs([
     "🃏 البطاقات",
     "📰 الأخبار",
     "📚 السجل التاريخي",
+    "🤖 توقع ML",
     "💬 Laithinho"
 ])
 
@@ -1127,6 +1322,24 @@ with tabs[6]:
                 cols_show = [c for c in ["الموسم","GW","total_points","minutes","goals_scored","assists","bonus","was_home"] if c in hh.columns]
                 st.dataframe(hh.sort_values(["الموسم","GW"]).tail(15)[cols_show],
                              use_container_width=True, hide_index=True)
+
+# ------------------------------------------------------------
+# تبويب Machine Learning
+# ------------------------------------------------------------
+with tabs[7]:
+    st.subheader("🤖 محرك التوقعات ML — V6.0")
+    if ml_info.get("trained"):
+        a,b,c=st.columns(3)
+        a.metric("حالات التدريب", f"{ml_info['rows']:,}")
+        b.metric("خطأ الاختبار MAE", f"{ml_info['mae']:.2f}" if ml_info.get("mae") is not None else "—")
+        c.metric("المواسم", " + ".join(ml_info.get("seasons", [])))
+        st.success("محرك ML فعّال: يتعلم من بيانات تاريخية قبل الجولة، ثم يدمج توقعه مع محرك Laithinho.")
+        show=df[["web_name","team_name","توقع_ML","النقاط_المتوقعة","مخاطرة_القرار"]].copy().sort_values("توقع_ML",ascending=False).head(25)
+        show.columns=["اللاعب","الفريق","توقع ML","توقع Laithinho","مخاطرة القرار"]
+        st.dataframe(show,use_container_width=True)
+        st.info("في بداية الموسم لا نعتمد على Last 5/10 كأنها موجودة؛ GW1 تدخل كبيانات حديثة، والتاريخ السابق يعوّض قلة العينة.")
+    else:
+        st.warning("لم تتوفر بيانات تاريخية كافية لتدريب النموذج. سيستمر المحرك التقليدي بالعمل.")
 
 # ------------------------------------------------------------
 # تبويب المحادثة

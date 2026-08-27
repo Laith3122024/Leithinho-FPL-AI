@@ -4,3 +4,4 @@ numpy
 requests
 pulp
 Pillow
+scikit-learn
