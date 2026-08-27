@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-Laithinho FPL AI V6.3.1
+Laithinho FPL AI V6.4 — Match Brain
 نسخة عربية متكاملة — إصلاح أخطاء البيانات التاريخية:
 - بيانات FPL الحالية
 - آخر الجولات
@@ -22,6 +22,7 @@ Laithinho FPL AI V6.3.1
 """
 
 import html
+import math
 from io import BytesIO
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -125,18 +126,57 @@ def load_current():
         if c in p.columns:
             p[c] = pd.to_numeric(p[c], errors="coerce").fillna(0)
 
-    current = events[events["is_current"] == True]
-    nxt = events[events["is_next"] == True]
+    # "الجولة الحالية" في API ليست دائمًا هي الجولة التي يجب التنبؤ بها:
+    # بعد انتهاء آخر مباراة قد تبقى is_current=True لفترة قصيرة.
+    # لذلك نحدد جولة التوقع اعتمادًا على حالة finished للموسم والمباريات نفسها.
+    fixtures_df = pd.DataFrame(fx)
+    current = events[events["is_current"] == True].copy()
+    nxt = events[events["is_next"] == True].copy()
+
+    if not current.empty:
+        api_gw = int(current.iloc[0]["id"])
+        event_finished = bool(current.iloc[0].get("finished", False))
+        gw_fx = fixtures_df[pd.to_numeric(fixtures_df.get("event"), errors="coerce") == api_gw] if "event" in fixtures_df.columns else pd.DataFrame()
+        fixture_finished = (
+            not gw_fx.empty and
+            gw_fx["finished"].fillna(False).astype(bool).all()
+            if "finished" in gw_fx.columns else False
+        )
+
+        if not event_finished and not fixture_finished:
+            prediction_gw = api_gw
+        else:
+            if not nxt.empty:
+                prediction_gw = int(nxt.iloc[0]["id"])
+            else:
+                future_events = events[pd.to_numeric(events["id"], errors="coerce") > api_gw].copy()
+                if not future_events.empty and "finished" in future_events.columns:
+                    unfinished = future_events[~future_events["finished"].fillna(False).astype(bool)]
+                else:
+                    unfinished = future_events
+                prediction_gw = int(unfinished.iloc[0]["id"]) if not unfinished.empty else api_gw + 1
+    elif not nxt.empty:
+        prediction_gw = int(nxt.iloc[0]["id"])
+    else:
+        if "finished" in events.columns:
+            unfinished = events[~events["finished"].fillna(False).astype(bool)].copy()
+        else:
+            unfinished = events.copy()
+        prediction_gw = int(unfinished.iloc[0]["id"]) if not unfinished.empty else 1
+
+    # نحتفظ بـgw كمرجع لجولة API الحالية، بينما prediction_gw هي الجولة التي
+    # يجب أن يبني عليها Laithinho التوقعات.
     if not current.empty:
         gw = int(current.iloc[0]["id"])
     elif not nxt.empty:
         gw = int(nxt.iloc[0]["id"])
     else:
-        gw = 1
-    return p, teams, events, pd.DataFrame(fx), team_names, gw
+        gw = prediction_gw
+
+    return p, teams, events, fixtures_df, team_names, gw, prediction_gw
 
 try:
-    df, teams_df, events_df, fixtures, team_names, current_gw = load_current()
+    df, teams_df, events_df, fixtures, team_names, current_gw, prediction_gw = load_current()
 except Exception as exc:
     st.error("تعذر تحميل بيانات FPL الحالية.")
     st.code(str(exc))
@@ -168,6 +208,14 @@ with st.spinner("جاري تحميل البيانات التاريخية..."):
     history = load_history()
 
 # ============================================================
+# حالة الجولة — لا نتنبأ بجولة مكتملة
+# ============================================================
+st.info(
+    f"🎯 **جولة التوقع الحالية: GW{prediction_gw}** — "
+    f"الجولة التي انتهت لا تدخل كتوقع جديد؛ تُستخدم فقط كبيانات فعلية لتقييم النموذج وتحسينه."
+)
+
+# ============================================================
 # أدوات البيانات
 # ============================================================
 def num(series):
@@ -184,7 +232,7 @@ def upcoming(tid, horizon=6):
         if pd.isna(x.get("event")):
             continue
         gw = int(x["event"])
-        if gw < current_gw or gw > current_gw + horizon:
+        if gw < prediction_gw or gw > prediction_gw + horizon:
             continue
         if int(x["team_h"]) == int(tid):
             opp = team_names.get(int(x["team_a"]), "?")
@@ -211,7 +259,7 @@ def dgw_count(tid, horizon=8):
     return sum(v >= 2 for v in counts.values())
 
 # ============================================================
-# V6.3 — محرك المباراة القادمة
+# V6.4 — محرك المباراة القادمة (Poisson + Match Brain)
 # ============================================================
 # الفكرة الأساسية: قبل أن نتوقع نقاط اللاعب، نتوقع المباراة نفسها.
 # نستخدم قوة الفريق الرسمية في FPL + Home/Away + FDR، ثم نحوّلها إلى
@@ -231,8 +279,10 @@ def _strength(row, key, fallback=1000.0):
 
 @st.cache_data(ttl=1800)
 def build_match_predictions(_fixtures, _teams_df, _team_names, gw):
-    # المتوسطات الافتراضية للدوري تُستخدم فقط كمرساة، ثم نعدلها بقوة الفرق.
-    league_goal = 1.45
+    """V6.4 Match Engine: normalized team ratings + FDR + Poisson probabilities.
+    الهدف ليس إعطاء نتيجة قطعية، بل توزيع احتمالات أكثر منطقية للجولة القادمة.
+    """
+    league_home, league_away = 1.55, 1.20
     rows = []
     future = _fixtures[_fixtures["event"].notna()].copy() if "event" in _fixtures.columns else pd.DataFrame()
     if future.empty:
@@ -242,61 +292,75 @@ def build_match_predictions(_fixtures, _teams_df, _team_names, gw):
     if future.empty:
         return pd.DataFrame()
 
+    cols = {
+        "ah": "strength_attack_home", "aa": "strength_attack_away",
+        "dh": "strength_defence_home", "da": "strength_defence_away"
+    }
+    med = {}
+    for k, c in cols.items():
+        vals = pd.to_numeric(_teams_df[c], errors="coerce") if c in _teams_df.columns else pd.Series(dtype=float)
+        med[k] = float(vals.replace([np.inf,-np.inf], np.nan).dropna().median()) if not vals.dropna().empty else 1100.0
+
+    def rating(tid, key):
+        r = _teams_df[_teams_df["id"] == int(tid)]
+        if r.empty: return med[key]
+        c = cols[key]
+        try:
+            v=float(r.iloc[0].get(c, med[key]))
+            return v if np.isfinite(v) and v>0 else med[key]
+        except Exception:
+            return med[key]
+
+    def poisson_zero(lam): return float(np.exp(-max(lam, 0)))
+    def poisson_two_plus(lam): return float(1 - np.exp(-lam)*(1+lam))
+
     for _, fx in future.sort_values("event").iterrows():
         th, ta = int(fx["team_h"]), int(fx["team_a"])
-        rh, ra = _team_strength_row(th), _team_strength_row(ta)
-        # FPL strength_* fields are scaled ratings. We use the correct home/away
-        # attack and defence fields when available.
-        ah = _strength(rh, "strength_attack_home", _strength(rh, "strength", 1000))
-        da = _strength(rh, "strength_defence_home", _strength(rh, "strength", 1000))
-        aa = _strength(ra, "strength_attack_away", _strength(ra, "strength", 1000))
-        dh = _strength(ra, "strength_defence_away", _strength(ra, "strength", 1000))
+        # Attack/defence are normalized to the league median, avoiding the old
+        # arbitrary 1100 denominator and making team differences comparable.
+        ah = np.clip(rating(th,"ah")/med["ah"], .65, 1.55)
+        aa = np.clip(rating(ta,"aa")/med["aa"], .65, 1.55)
+        dh = np.clip(rating(th,"dh")/med["dh"], .65, 1.55)
+        da = np.clip(rating(ta,"da")/med["da"], .65, 1.55)
+        fdr_h = float(pd.to_numeric(pd.Series([fx.get("team_h_difficulty",3)]), errors="coerce").fillna(3).iloc[0])
+        fdr_a = float(pd.to_numeric(pd.Series([fx.get("team_a_difficulty",3)]), errors="coerce").fillna(3).iloc[0])
+        # FDR is deliberately a secondary correction, not the entire model.
+        fdr_mod_h = np.clip(1.0 + 0.065*(3-fdr_h), .82, 1.18)
+        fdr_mod_a = np.clip(1.0 + 0.065*(3-fdr_a), .82, 1.18)
+        xg_h = league_home * ah * (1.0/dh) * fdr_mod_h
+        xg_a = league_away * aa * (1.0/da) * fdr_mod_a
+        xg_h = float(np.clip(xg_h, .25, 3.8)); xg_a = float(np.clip(xg_a, .15, 3.2))
 
-        # Convert ratings into relative attack/defence multipliers. Clamp to avoid
-        # absurd early-season predictions when only one GW exists.
-        att_h = np.clip(ah / 1100.0, .55, 1.75)
-        att_a = np.clip(aa / 1100.0, .55, 1.75)
-        def_h = np.clip(da / 1100.0, .55, 1.75)
-        def_a = np.clip(dh / 1100.0, .55, 1.75)
-
-        xg_h = league_goal * att_h * (2.0 / (1.0 + def_a)) * 1.08
-        xg_a = league_goal * att_a * (2.0 / (1.0 + def_h)) * .92
-        xg_h = float(np.clip(xg_h, .20, 3.80))
-        xg_a = float(np.clip(xg_a, .15, 3.20))
-
-        # FDR is an explicit opponent-strength signal.
-        fdr_h = float(fx.get("team_h_difficulty", 3) or 3)
-        fdr_a = float(fx.get("team_a_difficulty", 3) or 3)
-        xg_h *= float(np.clip(1.08 - .055 * (fdr_h - 3), .82, 1.18))
-        xg_a *= float(np.clip(1.08 - .055 * (fdr_a - 3), .82, 1.18))
-
-        total = xg_h + xg_a
-        p_h_win = float(np.clip(.50 + .16 * (xg_h - xg_a), .08, .90))
-        p_a_win = float(np.clip(.50 + .16 * (xg_a - xg_h), .08, .90))
-        p_draw = float(np.clip(1.0 - p_h_win - p_a_win + .18, .08, .38))
-        norm = p_h_win + p_a_win + p_draw
-        p_h_win, p_a_win, p_draw = p_h_win/norm, p_a_win/norm, p_draw/norm
-
-        cs_h = float(np.exp(-xg_a))
-        cs_a = float(np.exp(-xg_h))
-        over25 = float(1 - np.exp(-total) * (1 + total + (total**2)/2))
-        h_2plus = float(1 - np.exp(-xg_h) * (1 + xg_h))
-        a_2plus = float(1 - np.exp(-xg_a) * (1 + xg_a))
-
+        # Convert xG to win/CS/scoring probabilities using Poisson.
+        p0h, p0a = poisson_zero(xg_h), poisson_zero(xg_a)
+        cs_h, cs_a = p0a, p0h
+        # Exact score grid gives more stable win probabilities than a linear formula.
+        p_hw=p_dr=p_aw=0.0
+        for gh in range(0,8):
+            ph=np.exp(-xg_h)*(xg_h**gh)/math.factorial(gh)
+            for ga in range(0,8):
+                pa=np.exp(-xg_a)*(xg_a**ga)/math.factorial(ga)
+                q=ph*pa
+                if gh>ga: p_hw+=q
+                elif gh==ga: p_dr+=q
+                else: p_aw+=q
+        z=p_hw+p_dr+p_aw
+        p_hw,p_dr,p_aw=p_hw/z,p_dr/z,p_aw/z
+        total=xg_h+xg_a
         rows.append({
-            "gw": int(fx["event"]), "fixture_id": int(fx.get("id", -1)),
-            "home_id": th, "away_id": ta,
-            "home": _team_names.get(th, "?"), "away": _team_names.get(ta, "?"),
-            "xg_home": xg_h, "xg_away": xg_a,
-            "home_win": p_h_win, "draw": p_draw, "away_win": p_a_win,
-            "cs_home": cs_h, "cs_away": cs_a,
-            "home_2plus": h_2plus, "away_2plus": a_2plus,
-            "over_2_5": over25,
-            "fdr_home": fdr_h, "fdr_away": fdr_a,
+            "gw":int(fx["event"]), "fixture_id":int(fx.get("id",-1)),
+            "home_id":th,"away_id":ta,
+            "home":_team_names.get(th,"?"),"away":_team_names.get(ta,"?"),
+            "xg_home":xg_h,"xg_away":xg_a,
+            "home_win":float(p_hw),"draw":float(p_dr),"away_win":float(p_aw),
+            "cs_home":cs_h,"cs_away":cs_a,
+            "home_2plus":poisson_two_plus(xg_h),"away_2plus":poisson_two_plus(xg_a),
+            "over_2_5":float(1-np.exp(-total)*(1+total+total**2/2)),
+            "fdr_home":fdr_h,"fdr_away":fdr_a,
         })
     return pd.DataFrame(rows)
 
-match_predictions = build_match_predictions(fixtures, teams_df, team_names, current_gw)
+match_predictions = build_match_predictions(fixtures, teams_df, team_names, prediction_gw)
 
 def next_match(tid):
     if match_predictions.empty:
@@ -348,56 +412,82 @@ def _team_xg_sum(tid):
 # توزيع xG الفردي من بيانات FPL الحالية؛ إذا لم توجد xG، نستخدم xGI كنقطة
 # انطلاق حتى لا نكسر اللاعبين الجدد.
 def add_match_aware_player_projection(frame):
-    out = frame.copy()
-    team_xg_map = {}
-    team_xg_total = {}
-    for tid in out["team"].dropna().unique():
-        team_xg_map[int(tid)] = _team_xg_sum(int(tid))
-        g = out[out["team"] == tid]
-        team_xg_total[int(tid)] = float(num(g.get("expected_goals", 0)).sum())
+    """V6.4: player prediction derived from match probabilities + player rates.
+    يستخدم التاريخ لتثبيت عينة GW1 الصغيرة، ويمنع حارسًا رخيصًا من الفوز لمجرد السعر.
+    """
+    out=frame.copy()
+    out["__hist_minutes_per90"]=(num(out.get("hist_minutes",0))/90.0).clip(lower=0)
+    out["__hist_xgi90"]=np.where(num(out.get("hist_minutes",0))>0,
+        num(out.get("hist_xgi",0))/num(out.get("hist_minutes",0))*90.0,0)
+    out["__cur_xgi90"]=np.where(num(out.get("minutes",0))>0,
+        num(out.get("expected_goal_involvements",0))/num(out.get("minutes",0))*90.0,0)
+    out["__att_rate"]=np.clip(
+        np.where((out["__cur_xgi90"]>0)&(out["__hist_xgi90"]>0),
+                 .60*out["__cur_xgi90"]+.40*out["__hist_xgi90"],
+                 np.where(out["__cur_xgi90"]>0,out["__cur_xgi90"],out["__hist_xgi90"])),0,1.5)
 
-    exp_goal = num(out.get("expected_goals", 0))
-    exp_assist = num(out.get("expected_assists", 0))
-    exp_xgi = num(out.get("expected_goal_involvements", 0))
-    team_share = []
-    for idx, r in out.iterrows():
-        tid = int(r["team"])
-        denom = team_xg_total.get(tid, 0.0)
-        if denom > 0 and float(exp_goal.loc[idx]) > 0:
-            share = float(exp_goal.loc[idx] / denom)
-        else:
-            g = out[out["team"] == tid]
-            xgi_total = float(num(g.get("expected_goal_involvements", 0)).sum())
-            share = float(exp_xgi.loc[idx] / xgi_total) if xgi_total > 0 else 0.05
-        team_share.append(float(np.clip(share, 0.01, .45)))
-    out["حصة_أهداف_الفريق"] = team_share
-    out["xG_الجولة_القادمة"] = [team_xg_map.get(int(t), 1.45) * s for t, s in zip(out["team"], out["حصة_أهداف_الفريق"])]
-    out["xA_الجولة_القادمة"] = np.clip(exp_assist * (0.7 + 0.6 * out["قوة_المواجهة"]), 0, 1.2)
+    # Base attacking rates by position, used only when a player has little/no sample.
+    pos=num(out["element_type"])
+    base_rate=np.select([pos==4,pos==3,pos==2],[.65,.42,.18],default=0.0)
+    out["__att_rate"]=np.where(out["__att_rate"]>0,out["__att_rate"],base_rate)
 
-    pos = num(out["element_type"])
-    minutes_factor = out["احتمال_البداية_والتواجد"].clip(0,1)
-    cs = out["احتمال_كلين_شيت"].clip(0,1)
-    # FPL scoring expectation approximation: appearance + goals + assists + CS +
-    # a small bonus component. This is intentionally an interpretable layer.
-    appearance = 2.0 * minutes_factor
-    goal_points = np.where(pos == 4, 4.0, np.where(pos == 3, 5.0, np.where(pos == 2, 6.0, 10.0))) * out["xG_الجولة_القادمة"]
-    assist_points = 3.0 * out["xA_الجولة_القادمة"]
-    cs_points = np.where(pos == 2, 4.0, np.where(pos == 3, 1.0, 0.0)) * cs * minutes_factor
-    bonus = .35 * out["مؤشر_الاعتماد_الأساسي"] + .25 * out["bps_n"] + .20 * out["ict_n"]
-    match_raw = appearance + goal_points + assist_points + cs_points + bonus
+    # Allocate each team's xG using attacking rate * expected minutes.
+    team_xg={}
+    for tid in out["team"].dropna().unique(): team_xg[int(tid)]=_team_xg_sum(int(tid))
+    weights=[]
+    for _,r in out.iterrows():
+        mins=90.0*float(np.clip(r["احتمال_البداية_والتواجد"],0,1))
+        role=float(r["__att_rate"])
+        weights.append(max(role,0.02)*(0.35+0.65*mins/90.0))
+    out["__share_weight"]=weights
+    totals=out.groupby("team")["__share_weight"].transform("sum").replace(0,np.nan)
+    out["حصة_أهداف_الفريق"]=(out["__share_weight"]/totals).fillna(.02).clip(.005,.55)
+    out["xG_الجولة_القادمة"]=[team_xg.get(int(t),1.45)*s for t,s in zip(out["team"],out["حصة_أهداف_الفريق"])]
 
-    # Match-aware blend: the fixture can move the prediction materially, but ML
-    # and historical/current form remain in the decision.
-    out["توقع_المباراة"] = np.clip(match_raw, .2, 18)
-    out["النقاط_المتوقعة_المباراة_الواعية"] = np.clip(
-        .55 * out["توقع_المباراة"] + .30 * out["النقاط_المتوقعة"] + .15 * out["توقع_ML"].fillna(out["النقاط_المتوقعة"]),
-        .2, 18
-    )
-    # Strong match signals can lift ceiling; poor fixtures can lower it.
-    out["سقف_النقاط_التقديري"] = np.clip(
-        out["النقاط_المتوقعة_المباراة_الواعية"] + 4.0 * out["xG_الجولة_القادمة"] + 2.0 * out["xA_الجولة_القادمة"] + 2.0 * out["احتمال_كلين_شيت"] * (pos == 2),
-        .5, 25
-    )
+    # xA: combine current assist involvement and historical xGI signal.
+    cur_xa=num(out.get("expected_assists",0))
+    hist_xgi=num(out.get("hist_xgi",0))
+    hist_min=num(out.get("hist_minutes",0))
+    hist_xa90=np.where(hist_min>0,hist_xgi/hist_min*90.0*.38,0)
+    cur_xa90=np.where(num(out.get("minutes",0))>0,cur_xa/num(out.get("minutes",0))*90.0,0)
+    xa90=np.clip(np.where(cur_xa90>0,.65*cur_xa90+.35*hist_xa90,hist_xa90),0,.9)
+    out["xA_الجولة_القادمة"]=np.clip(xa90*(90* out["احتمال_البداية_والتواجد"])/90.0,0,0.9)
+
+    minutes_factor=out["احتمال_البداية_والتواجد"].clip(0,1)
+    cs=out["احتمال_كلين_شيت"].clip(0,1)
+    expected_minutes=90*minutes_factor
+    # Appearance: 1 point for <60, 2 for 60+. Approximate with a smooth probability.
+    p60=np.clip((expected_minutes-45)/25,0,1)
+    appearance=minutes_factor*(1+p60)
+    goal_points=np.where(pos==4,4.0,np.where(pos==3,5.0,np.where(pos==2,6.0,0.0)))*out["xG_الجولة_القادمة"]
+    assist_points=3.0*out["xA_الجولة_القادمة"]
+    cs_points=np.where((pos==1)|(pos==2),4.0,np.where(pos==3,1.0,0.0))*cs*minutes_factor
+    # GK saves: opponent xG -> shots on target proxy -> save points, capped conservatively.
+    opp_xg=[]
+    for _,r in out.iterrows():
+        m=next_match(int(r["team"]))
+        if m is None: opp_xg.append(1.2)
+        else: opp_xg.append(float(m["xg_away"] if int(m["home_id"])==int(r["team"]) else m["xg_home"]))
+    opp_xg=np.asarray(opp_xg)
+    save_points=np.where(pos==1,np.clip((opp_xg*2.2*0.34)/3,0,1.4),0.0)*minutes_factor
+    # Goals conceded penalty for GK/DEF is expected, not deterministic.
+    gc_pen=np.where((pos==1)|(pos==2),np.clip(opp_xg*.15,0,1.0),0.0)*minutes_factor
+    # Bonus proxy is damped; it must not overpower fixture/goal expectation.
+    bonus=.45*out["مؤشر_الاعتماد_الأساسي"]+.20*out["bps_n"]+.15*out["ict_n"]
+    match_raw=appearance+goal_points+assist_points+cs_points+save_points-gc_pen+bonus
+    out["توقع_المباراة"]=np.clip(match_raw,.1,20)
+    # ML gets a smaller role when the match model has high-quality fixture data.
+    base=out["النقاط_المتوقعة"].fillna(3.0)
+    ml=out["توقع_ML"].fillna(base)
+    out["النقاط_المتوقعة_المباراة_الواعية"]=np.clip(
+        .68*out["توقع_المباراة"]+.20*base+.12*ml,.1,20)
+    out["سقف_النقاط_التقديري"]=np.clip(
+        out["النقاط_المتوقعة_المباراة_الواعية"]
+        +5.0*out["xG_الجولة_القادمة"]+2.5*out["xA_الجولة_القادمة"]
+        +2.5*cs*(pos==2),.5,28)
+    out["ثقة_التوقع"]=np.clip(
+        100*(.35*out["احتمال_البداية_والتواجد"]+.25*(1-out["مخاطرة_القرار"]/100)
+             +.20*np.minimum(out["hist_gws"]/20,1)+.20*np.clip(out["قوة_المواجهة"],0,1)),0,100)
     return out
 
 # ملاحظة: لا نستدعي طبقة المباراة هنا، لأن أعمدة التواجد واعتماد المدرب
@@ -410,7 +500,8 @@ def historical_player_stats(name):
     if history.empty or "name" not in history.columns:
         return {
             "hist_points": 0, "hist_ppg": 0, "hist_minutes": 0,
-            "hist_starts": 0, "hist_xgi": 0, "hist_home": 0,
+            "hist_starts": 0, "hist_xgi": 0, "hist_goals": 0, "hist_assists": 0,
+            "hist_bps": 0, "hist_ict": 0, "hist_home": 0,
             "hist_away": 0, "hist_gws": 0
         }
 
@@ -422,7 +513,8 @@ def historical_player_stats(name):
     if h.empty:
         return {
             "hist_points": 0, "hist_ppg": 0, "hist_minutes": 0,
-            "hist_starts": 0, "hist_xgi": 0, "hist_home": 0,
+            "hist_starts": 0, "hist_xgi": 0, "hist_goals": 0, "hist_assists": 0,
+            "hist_bps": 0, "hist_ict": 0, "hist_home": 0,
             "hist_away": 0, "hist_gws": 0
         }
 
@@ -443,6 +535,10 @@ def historical_player_stats(name):
         "hist_minutes": float(minutes.sum()),
         "hist_starts": float((minutes >= 60).sum()),
         "hist_xgi": float(xgi.sum()),
+        "hist_goals": float(num(h.get("goals_scored", 0)).sum()),
+        "hist_assists": float(num(h.get("assists", 0)).sum()),
+        "hist_bps": float(num(h.get("bps", 0)).sum()),
+        "hist_ict": float(num(h.get("ict_index", 0)).sum()),
         "hist_home": float(points[home_mask].mean()) if home_mask.any() else 0,
         "hist_away": float(points[~home_mask].mean()) if (~home_mask).any() else 0,
         "hist_gws": int(len(h))
@@ -492,7 +588,7 @@ if not history_summary.empty:
 
 for c in [
     "hist_points", "hist_ppg", "hist_minutes", "hist_starts",
-    "hist_xgi", "hist_home", "hist_away", "hist_gws"
+    "hist_xgi", "hist_goals", "hist_assists", "hist_bps", "hist_ict", "hist_home", "hist_away", "hist_gws"
 ]:
     if c not in df.columns:
         df[c] = 0
@@ -612,7 +708,7 @@ df = pd.concat([df, avail], axis=1)
 # لا نساوي بين لاعب يملك نقاطًا جيدة لكنه حبيس الدكة، ولاعب يعتمد عليه
 # المدرب ويبدأ معظم المباريات. في بداية الموسم نستخدم GW المتاحة فقط،
 # ثم تزداد دقة المؤشر تلقائيًا مع مرور الجولات.
-completed_gws = max(int(current_gw) - 1, 1)
+completed_gws = max(int(prediction_gw) - 1, 1)
 df["معدل_البدايات_الحالي"] = (df["starts"] / completed_gws).clip(0, 1)
 df["معدل_الدقائق_الحالي"] = (df["minutes"] / (completed_gws * 90.0)).clip(0, 1)
 df["معدل_البدايات_التاريخي"] = (df["hist_starts"] / df["hist_gws"].replace(0, np.nan)).fillna(0).clip(0, 1)
@@ -703,7 +799,67 @@ def risk_label(x):
 
 
 # ============================================================
-# V6.2 — Machine Learning Prediction Engine
+# V6.4.1 — Ownership Intelligence
+# ============================================================
+# الملكية ليست جزءًا من Expected Points نفسه؛ هي طبقة قرار استراتيجية.
+# لاعب ذو ملكية مرتفعة = خيار أكثر أمانًا من ناحية الـRank/EO، وليس "مضمونًا".
+# لاعب منخفض الملكية مع توقع قوي = Differential محتمل.
+def ownership_profile(row):
+    own = float(np.clip(pd.to_numeric(pd.Series([row.get("selected_by_percent", 0)]), errors="coerce").fillna(0).iloc[0], 0, 100))
+    xp = float(max(pd.to_numeric(pd.Series([row.get("النقاط_المتوقعة", 0)]), errors="coerce").fillna(0).iloc[0], 0))
+
+    if own >= 60:
+        tier = "🛡️ ملكية ضخمة — Template Anchor"
+        security = 100
+    elif own >= 35:
+        tier = "🟢 ملكية مرتفعة — خيار آمن نسبيًا"
+        security = 82
+    elif own >= 15:
+        tier = "🟡 ملكية متوسطة"
+        security = 58
+    elif own >= 10:
+        tier = "🟠 ملكية منخفضة"
+        security = 38
+    elif own >= 5:
+        tier = "🔥 Differential"
+        security = 22
+    else:
+        tier = "🚀 Differential نادر"
+        security = 10
+
+    # قوة الديفرنتشال تعتمد على جودة التوقع + انخفاض الملكية،
+    # وليس على انخفاض الملكية وحده.
+    own_factor = float(np.clip((20.0 - own) / 20.0, 0, 1))
+    xp_factor = float(np.clip(xp / 8.0, 0, 1))
+    differential_score = 100 * (0.65 * own_factor + 0.35 * xp_factor)
+
+    if own >= 60 and xp >= 6:
+        decision = "🛡️ ركيزة آمنة: ملكية عالية + توقع قوي"
+    elif own <= 10 and xp >= 6:
+        decision = "🔥 Differential قوي: ملكية منخفضة + توقع مرتفع"
+    elif own <= 10 and xp >= 5:
+        decision = "🟠 Differential يستحق المراقبة"
+    elif own >= 35 and xp < 4.5:
+        decision = "⚠️ ملكية عالية لكن التوقع الحالي ليس قويًا؛ لا نعتبرها وحدها سببًا للاختيار"
+    else:
+        decision = "⚖️ خيار متوازن حسب التوقع والملكية"
+
+    return pd.Series({
+        "ملكية_اللاعب": own,
+        "تصنيف_الملكية": tier,
+        "أمان_الملكية": security,
+        "درجة_الديفرنتشال": float(np.clip(differential_score, 0, 100)),
+        "قرار_الملكية": decision,
+    })
+
+
+# نضيف الملكية بعد اكتمال التوقع الأساسي؛ الملكية لا تغيّر xP الخام،
+# بل تضيف طبقة أمان/Differential إلى القرار النهائي.
+ownership = df.apply(ownership_profile, axis=1)
+df = pd.concat([df, ownership], axis=1)
+
+# ============================================================
+# V6.4 — Machine Learning Prediction Engine
 # ============================================================
 # هذا نموذج ML فعلي: يتعلم من صفوف تاريخية "قبل الجولة" ويتنبأ
 # بالنقاط الفعلية للجولة التالية. لا نستخدم نقاط نفس الجولة كمدخل.
@@ -877,7 +1033,7 @@ def make_current_ml_features(frame):
     out["ml_price"] = num(frame.get("price", 0))
     out["ml_position"] = num(frame.get("element_type", 0))
     out["ml_home"] = 0.0
-    completed = max(int(current_gw) - 1, 1)
+    completed = max(int(prediction_gw) - 1, 1)
     out["ml_start_rate"] = (num(frame.get("starts", 0)) / completed).clip(0, 1)
     out["ml_minutes_rate"] = (num(frame.get("minutes", 0)) / (completed * 90.0)).clip(0, 1)
 
@@ -955,6 +1111,11 @@ df["النقاط_المتوقعة"] *= (
 )
 df.loc[df["غياب_طويل_أو_غير_محدد"], "النقاط_المتوقعة"] *= 0.15
 df["النقاط_المتوقعة"] = df["النقاط_المتوقعة"].clip(.2, 18)
+
+# تحديث طبقة الملكية بعد الوصول إلى التوقع النهائي.
+ownership = df.apply(ownership_profile, axis=1)
+df = df.drop(columns=[c for c in ["ملكية_اللاعب","تصنيف_الملكية","أمان_الملكية","درجة_الديفرنتشال","قرار_الملكية"] if c in df.columns])
+df = pd.concat([df, ownership], axis=1)
 
 # ============================================================
 # تحسين الفريق
@@ -1219,11 +1380,11 @@ xi = best_xi(squad)
 # تبويب الفريق
 # ------------------------------------------------------------
 with tabs[0]:
-    st.subheader(f"🏟️ تشكيلة Laithinho المقترحة — الجولة {current_gw}")
+    st.subheader(f"🏟️ تشكيلة Laithinho المقترحة — الجولة {prediction_gw}")
 
     st.markdown("### 🗓️ تحليل المباريات القادمة")
     if not match_predictions.empty:
-        mp = match_predictions[match_predictions["gw"] == int(current_gw)].copy()
+        mp = match_predictions[match_predictions["gw"] == int(prediction_gw)].copy()
         if mp.empty:
             mp = match_predictions.head(10).copy()
         mp["المباراة"] = mp["home"] + " 🆚 " + mp["away"]
@@ -1234,6 +1395,19 @@ with tabs[0]:
         st.dataframe(mp[["المباراة","التوقع","فوز صاحب الأرض","كلين شيت صاحب الأرض","كلين شيت الضيف"]], use_container_width=True, hide_index=True)
     else:
         st.info("لا توجد مباريات قادمة متاحة حاليًا من مصدر FPL.")
+
+    st.markdown("### 🎯 الملكية: الركائز الآمنة والـDifferentials")
+    own_view = df[(df["النقاط_المتوقعة"] >= 5.0) & (df["احتمال_البداية_والتواجد"] >= 0.65)].copy()
+    if not own_view.empty:
+        safe = own_view[own_view["ملكية_اللاعب"] >= 35].sort_values("النقاط_المتوقعة", ascending=False).head(5)
+        diff = own_view[own_view["ملكية_اللاعب"] <= 10].sort_values(["النقاط_المتوقعة","درجة_الديفرنتشال"], ascending=[False,False]).head(5)
+        a,b = st.columns(2)
+        with a:
+            st.markdown("**🛡️ ركائز عالية الملكية**")
+            st.dataframe(safe[["web_name","team_name","ملكية_اللاعب","النقاط_المتوقعة","قرار_الملكية"]], use_container_width=True, hide_index=True)
+        with b:
+            st.markdown("**🔥 Differentials محتملة**")
+            st.dataframe(diff[["web_name","team_name","ملكية_اللاعب","النقاط_المتوقعة","درجة_الديفرنتشال","قرار_الملكية"]], use_container_width=True, hide_index=True)
 
     if xi.empty:
         st.error("لم أستطع بناء تشكيلة بهذه الميزانية.")
@@ -1257,7 +1431,8 @@ with tabs[0]:
                         <b>{html.escape(str(p.web_name))}</b> {tag}<br>
                         <span>{html.escape(str(p.team_name))}</span><br>
                         <span>£{p.price:.1f}م</span><br>
-                        <span class="good">{p.النقاط_المتوقعة:.2f} متوقعة</span>
+                        <span class="good">{p.النقاط_المتوقعة:.2f} متوقعة</span><br>
+                        <span class="small">ملكية {p.ملكية_اللاعب:.1f}% · {p.تصنيف_الملكية}</span>
                         </div>""",
                         unsafe_allow_html=True
                     )
@@ -1440,7 +1615,8 @@ with tabs[1]:
                         <b>{html.escape(str(p.web_name))}</b> {tag}<br>
                         <span>{html.escape(str(p.team_name))}</span><br>
                         <span>£{p.price:.1f}م</span><br>
-                        <span class="good">{p.النقاط_المتوقعة:.2f} متوقعة</span>
+                        <span class="good">{p.النقاط_المتوقعة:.2f} متوقعة</span><br>
+                        <span class="small">ملكية {p.ملكية_اللاعب:.1f}% · {p.تصنيف_الملكية}</span>
                         </div>''',
                         unsafe_allow_html=True
                     )
@@ -1489,13 +1665,14 @@ with tabs[1]:
         st.dataframe(
             weak[[
                 "web_name","team_name","price","النقاط_المتوقعة","آخر5_متوسط",
-                "hist_ppg","احتمال_البداية_والتواجد","قوة_المباريات","مخاطرة_القرار"
+                "hist_ppg","احتمال_البداية_والتواجد","قوة_المباريات","مخاطرة_القرار","ملكية_اللاعب","تصنيف_الملكية"
             ]],
             column_config={
                 "web_name":"اللاعب","team_name":"الفريق","price":"السعر",
                 "النقاط_المتوقعة":"xP الجولة","آخر5_متوسط":"متوسط آخر 5",
                 "hist_ppg":"متوسط تاريخي","احتمال_البداية_والتواجد":"احتمال التواجد",
-                "قوة_المباريات":"قوة المباريات","مخاطرة_القرار":"مخاطرة القرار"
+                "قوة_المباريات":"قوة المباريات","مخاطرة_القرار":"مخاطرة القرار",
+                "ملكية_اللاعب":"الملكية %","تصنيف_الملكية":"تصنيف الملكية"
             },
             use_container_width=True,
             hide_index=True
@@ -1539,6 +1716,12 @@ with tabs[2]:
     cols[3].metric("تاريخي", f"{p.hist_ppg:.2f}")
     cols[4].metric("مخاطرة القرار", f"{p.مخاطرة_القرار:.0f}/100")
 
+    o1, o2, o3 = st.columns(3)
+    o1.metric("ملكية اللاعب", f"{p.ملكية_اللاعب:.1f}%")
+    o2.metric("أمان الملكية", f"{p.أمان_الملكية:.0f}/100")
+    o3.metric("درجة الـDifferential", f"{p.درجة_الديفرنتشال:.0f}/100")
+    st.info(f"**الملكية:** {p.تصنيف_الملكية} — {p.قرار_الملكية}")
+
     st.markdown("### 🆚 المباراة القادمة — قلب التوقع")
     st.info(
         f"**{p['المباراة_القادمة']}** — {p['المباراة_القادمة_المكان']}\n\n"
@@ -1567,6 +1750,7 @@ with tabs[2]:
     الدقائق: {int(p.minutes)} — البدايات: {int(p.starts)}<br>
     آخر 5 جولات: {p.آخر5_نقاط:.0f} نقطة / متوسط {p.آخر5_متوسط:.2f}<br>
     آخر 5 xGI: {p.آخر5_xGI:.2f}<br>
+    ملكية اللاعب: {p.ملكية_اللاعب:.1f}% — {html.escape(str(p.تصنيف_الملكية))}<br>
     السجل التاريخي: {p.hist_points:.0f} نقطة في {int(p.hist_gws)} ظهور/جولة مسجلة،
     متوسط {p.hist_ppg:.2f}<br>
     <b>{risk_label(p.مخاطرة_القرار)}</b>
@@ -1623,17 +1807,17 @@ with tabs[3]:
             "النقاط المتوقعة","الفورمة","xGI","آخر 5 متوسط",
             "آخر 10 متوسط","المتوسط التاريخي","الدقائق",
             "البدايات","احتمال التواجد","قوة المباريات",
-            "مخاطرة القرار","حالة التوفر","DGW"
+            "مخاطرة القرار","الملكية %","تصنيف الملكية","درجة الـDifferential","حالة التوفر","DGW"
         ],
         a: [
             pa.النقاط_المتوقعة,pa.form,pa.expected_goal_involvements,pa.آخر5_متوسط,
             pa.آخر10_متوسط,pa.hist_ppg,pa.minutes,pa.starts,
-            pa.احتمال_البداية_والتواجد*100,pa.قوة_المباريات,pa.مخاطرة_القرار,pa.حالة_التوفر,pa.عدد_DGW
+            pa.احتمال_البداية_والتواجد*100,pa.قوة_المباريات,pa.مخاطرة_القرار,pa.ملكية_اللاعب,pa.تصنيف_الملكية,pa.درجة_الديفرنتشال,pa.حالة_التوفر,pa.عدد_DGW
         ],
         b: [
             pb.النقاط_المتوقعة,pb.form,pb.expected_goal_involvements,pb.آخر5_متوسط,
             pb.آخر10_متوسط,pb.hist_ppg,pb.minutes,pb.starts,
-            pb.احتمال_البداية_والتواجد*100,pb.قوة_المباريات,pb.مخاطرة_القرار,pb.حالة_التوفر,pb.عدد_DGW
+            pb.احتمال_البداية_والتواجد*100,pb.قوة_المباريات,pb.مخاطرة_القرار,pb.ملكية_اللاعب,pb.تصنيف_الملكية,pb.درجة_الديفرنتشال,pb.حالة_التوفر,pb.عدد_DGW
         ]
     })
     st.dataframe(comparison, use_container_width=True, hide_index=True)
