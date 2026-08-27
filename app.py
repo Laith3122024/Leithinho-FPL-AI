@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-Laithinho FPL AI V5.1
+Laithinho FPL AI V5.3
 نسخة عربية متكاملة — إصلاح أخطاء البيانات التاريخية:
 - بيانات FPL الحالية
 - آخر الجولات
@@ -23,6 +23,7 @@ Laithinho FPL AI V5.1
 """
 
 import html
+from io import BytesIO
 import urllib.parse
 import xml.etree.ElementTree as ET
 
@@ -31,13 +32,14 @@ import pandas as pd
 import pulp
 import requests
 import streamlit as st
+from PIL import Image
 
 # ============================================================
 # إعداد الصفحة
 # ============================================================
 st.set_page_config(
     page_title="Laithinho FPL AI",
-    page_icon="👔",
+    page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -59,13 +61,16 @@ text-align:center;margin:3px;box-shadow:0 3px 8px rgba(0,0,0,.25);min-height:95p
 .ai{background:#111923;border-right:4px solid #00ff87;border-radius:14px;padding:15px;margin:8px 0}
 .good{color:#00ff87;font-weight:800}.warn{color:#ffd166;font-weight:800}.bad{color:#ff5c7a;font-weight:800}
 .small{font-size:.85rem;color:#aeb8c5}
+.pitch-title{text-align:center;color:white;font-weight:900;font-size:1.15rem;margin:4px 0 12px}
+.row-label{text-align:center;color:rgba(255,255,255,.85);font-weight:800;margin:5px 0}
+.shirt-wrap{display:flex;justify-content:center;align-items:center;height:42px}
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown("""
 <div class="hero">
-<h1>👔 Laithinho FPL AI</h1>
-<p>تحليل الفانتسي من الجولة الحالية + آخر الجولات + تاريخ المواسم السابقة.</p>
+<h1>Laithinho FPL AI</h1>
+<p>حلّل فريقك مثل FPL: الأداء الحالي + آخر الجولات + التاريخ + المباريات + الأخبار.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -322,8 +327,20 @@ def recent_stats():
 
 recent = recent_stats()
 if not recent.empty:
-    for c in recent.columns:
-        df[c] = df["web_name"].map(recent[c]).fillna(0)
+    recent_reset = recent.reset_index().drop_duplicates(subset=["name"], keep="last")
+    df = df.merge(
+        recent_reset,
+        how="left",
+        left_on="web_name",
+        right_on="name",
+        suffixes=("", "_recent")
+    )
+    if "name" in df.columns:
+        df = df.drop(columns=["name"])
+    for c in ["آخر5_نقاط","آخر5_متوسط","آخر5_دقائق","آخر5_xGI","آخر10_متوسط"]:
+        if c not in df.columns:
+            df[c] = 0
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 else:
     for c in ["آخر5_نقاط","آخر5_متوسط","آخر5_دقائق","آخر5_xGI","آخر10_متوسط"]:
         df[c] = 0
@@ -447,6 +464,44 @@ def best_xi(squad):
     return best
 
 # ============================================================
+# هوية قمصان الفرق
+# ============================================================
+TEAM_COLORS = {
+    "Arsenal": ("#EF0107", "#FFFFFF"),
+    "Liverpool": ("#C8102E", "#FFFFFF"),
+    "Chelsea": ("#034694", "#FFFFFF"),
+    "Manchester City": ("#6CABDD", "#FFFFFF"),
+    "Manchester United": ("#DA291C", "#FFFFFF"),
+    "Tottenham Hotspur": ("#132257", "#FFFFFF"),
+    "Newcastle United": ("#241F20", "#FFFFFF"),
+    "Aston Villa": ("#670E36", "#FFFFFF"),
+    "Brighton": ("#0057B8", "#FFFFFF"),
+    "West Ham United": ("#7A263A", "#FFFFFF"),
+    "Everton": ("#003399", "#FFFFFF"),
+    "Crystal Palace": ("#1B458F", "#FFFFFF"),
+    "Fulham": ("#FFFFFF", "#111111"),
+    "Brentford": ("#E30613", "#FFFFFF"),
+    "Wolverhampton Wanderers": ("#FDB913", "#111111"),
+    "Bournemouth": ("#DA2915", "#FFFFFF"),
+    "Nottingham Forest": ("#DD0000", "#FFFFFF"),
+    "Leeds United": ("#FFCD00", "#111111"),
+    "Burnley": ("#6C1D45", "#FFFFFF"),
+    "Sunderland": ("#EB172B", "#FFFFFF"),
+}
+
+def team_colors(team_name):
+    return TEAM_COLORS.get(str(team_name), ("#4b5563", "#FFFFFF"))
+
+def shirt_svg(team_name, size=42):
+    primary, secondary = team_colors(team_name)
+    return f'''<div class="shirt-wrap">
+    <svg width="{size}" height="{size}" viewBox="0 0 64 64" aria-label="قميص {html.escape(str(team_name))}">
+      <path d="M18 10 L27 5 Q32 9 37 5 L46 10 L59 18 L51 31 L45 27 L45 57 L19 57 L19 27 L13 31 L5 18 Z" fill="{primary}" stroke="#111" stroke-width="1.5"/>
+      <path d="M27 5 Q32 12 37 5" fill="none" stroke="{secondary}" stroke-width="3"/>
+      <path d="M19 39 H45" stroke="{secondary}" stroke-width="2" opacity=".8"/>
+    </svg></div>'''
+
+# ============================================================
 # الأخبار
 # ============================================================
 @st.cache_data(ttl=900)
@@ -504,10 +559,100 @@ st.sidebar.write("• التاريخ: 2024/25 + 2025/26")
 st.sidebar.caption("البيانات التاريخية تستخدم كمرجع، وليست بديلًا عن حالة اللاعب الحالية.")
 
 # ============================================================
+# أدوات "تشكيلتي" الشخصية
+# ============================================================
+FORMATION_OPTIONS = {
+    "3-4-3": (3, 4, 3),
+    "3-5-2": (3, 5, 2),
+    "4-4-2": (4, 4, 2),
+    "4-3-3": (4, 3, 3),
+    "4-5-1": (4, 5, 1),
+    "5-4-1": (5, 4, 1),
+    "5-3-2": (5, 3, 2),
+    "5-2-3": (5, 2, 3),
+}
+
+def unique_player_df(position_type=None):
+    x = df.drop_duplicates("id").copy()
+    if position_type is not None:
+        x = x[x["element_type"] == position_type]
+    return x.sort_values(["team_name", "web_name"])
+
+def player_option_label(pid):
+    r = df[df["id"] == pid]
+    if r.empty:
+        return "اختيار لاعب"
+    r = r.iloc[0]
+    return f"{r.web_name} — {r.team_name} — £{r.price:.1f}م"
+
+def team_quality_score(my_squad, my_xi):
+    if my_squad.empty or my_xi.empty:
+        return 0.0
+    xi_avg = float(my_xi["النقاط_المتوقعة"].mean())
+    availability = float(my_squad["احتمال_البداية_والتواجد"].mean())
+    recent = float(normalize(my_squad["آخر5_متوسط"]).mean())
+    hist = float(normalize(my_squad["hist_ppg"]).mean())
+    fixture = float(my_squad["قوة_المباريات"].clip(0,1).mean())
+    score = 100 * (
+        .42 * min(xi_avg / 8.0, 1) +
+        .18 * availability +
+        .15 * recent +
+        .13 * hist +
+        .12 * fixture
+    )
+    return float(np.clip(score, 0, 100))
+
+def team_diagnosis(my_squad, my_xi):
+    score = team_quality_score(my_squad, my_xi)
+    strengths, weaknesses = [], []
+    if my_xi["النقاط_المتوقعة"].mean() >= 6.0:
+        strengths.append("متوسط النقاط المتوقعة للتشكيلة الأساسية جيد.")
+    if my_squad["احتمال_البداية_والتواجد"].mean() >= .85:
+        strengths.append("توافر اللاعبين الأساسيين جيد.")
+    if my_squad["hist_ppg"].mean() >= 3.5:
+        strengths.append("الفريق لديه قاعدة تاريخية جيدة.")
+    if my_squad["قوة_المباريات"].mean() >= .60:
+        strengths.append("المباريات القادمة مناسبة نسبيًا.")
+    if my_squad["عدد_DGW"].sum() >= 2:
+        strengths.append("هناك استفادة محتملة من الـDGW.")
+
+    weak_count = int((my_squad["مخاطرة_القرار"] >= 60).sum())
+    if weak_count:
+        weaknesses.append(f"هناك {weak_count} لاعب/لاعبين بقرار مرتفع المخاطرة.")
+    if my_squad["احتمال_البداية_والتواجد"].mean() < .75:
+        weaknesses.append("احتمال المشاركة في الفريق أقل من المطلوب.")
+    if my_squad["قوة_المباريات"].mean() < .45:
+        weaknesses.append("جدول المباريات القادم ليس مثاليًا.")
+    if my_squad["آخر5_متوسط"].mean() < 3.5:
+        weaknesses.append("الزخم الأخير للفريق ضعيف نسبيًا.")
+    if len(my_xi) == 11 and my_xi["النقاط_المتوقعة"].sum() < 55:
+        weaknesses.append("سقف النقاط المتوقع للـXI يحتاج تحسينًا.")
+
+    if not strengths:
+        strengths.append("لا توجد نقطة قوة واضحة جدًا؛ الفريق متوازن.")
+    if not weaknesses:
+        weaknesses.append("لا توجد نقطة ضعف كبيرة حسب البيانات الحالية.")
+    return score, strengths, weaknesses
+
+def latest_team_news(my_squad, max_players=8):
+    items = []
+    for _, p in my_squad.sort_values("مخاطرة_القرار", ascending=False).head(max_players).iterrows():
+        news = news_for_player(p.web_name, p.team_name)
+        for n in news[:2]:
+            items.append({
+                "player": p.web_name,
+                "title": translate_common_terms(n["العنوان"]),
+                "source": n["المصدر"],
+                "link": n["الرابط"],
+            })
+    return items
+
+# ============================================================
 # تبويبات الشاشة
 # ============================================================
 tabs = st.tabs([
     "🏟️ فريقي",
+    "👤 تشكيلتي",
     "🔎 تحليل اللاعبين",
     "⚖️ مقارنة",
     "🃏 البطاقات",
@@ -543,7 +688,7 @@ with tabs[0]:
                 with cols[j]:
                     st.markdown(
                         f"""<div class="player">
-                        <div class="shirt">👕</div>
+                        {shirt_svg(p.team_name)}
                         <b>{html.escape(str(p.web_name))}</b> {tag}<br>
                         <span>{html.escape(str(p.team_name))}</span><br>
                         <span>£{p.price:.1f}م</span><br>
@@ -559,7 +704,7 @@ with tabs[0]:
         for j, (_, p) in enumerate(bench.iterrows()):
             with cols[j]:
                 st.markdown(
-                    f"""<div class="player"><div class="shirt">👕</div>
+                    f"""<div class="player">{shirt_svg(p.team_name)}
                     <b>{p.web_name}</b><br><span>{p.team_name}</span><br>
                     <span class="good">{p.النقاط_المتوقعة:.2f} متوقعة</span></div>""",
                     unsafe_allow_html=True
@@ -572,9 +717,239 @@ with tabs[0]:
         )
 
 # ------------------------------------------------------------
-# تبويب تحليل اللاعبين
+# تبويب تشكيلتي الشخصية
 # ------------------------------------------------------------
 with tabs[1]:
+    st.subheader("👤 تشكيلتي — ابنِ فريقك مثل لعبة FPL وحلّله")
+    st.write(
+        "اختَر تشكيلتك من داخل الأداة. اختر الـ11 الأساسيين حسب المراكز ثم 4 لاعبين للدكة. "
+        "بعدها Laithinho يفحص القوة، نقاط الضعف، الكابتن، الدكة، التاريخ، آخر الجولات، "
+        "Home/Away، المباريات القادمة واحتمال المشاركة."
+    )
+
+    screenshot = st.file_uploader(
+        "📸 اختياري: ارفع Screenshot لتشكيلتك",
+        type=["png", "jpg", "jpeg", "webp"],
+        key="my_team_screenshot"
+    )
+    if screenshot is not None:
+        try:
+            image = Image.open(BytesIO(screenshot.getvalue()))
+            st.image(image, caption="Screenshot تشكيلتك", use_container_width=True)
+            st.info(
+                "الصورة تُعرض فقط في هذه النسخة. بناء التشكيلة يتم من الاختيارات أدناه "
+                "حتى تكون أسماء اللاعبين دقيقة."
+            )
+        except Exception:
+            st.error("لم أستطع قراءة الصورة. جرّب PNG أو JPG.")
+
+    formation = st.selectbox(
+        "🎮 اختر التشكيلة",
+        list(FORMATION_OPTIONS.keys()),
+        index=0,
+        key="my_formation"
+    )
+    def_n, mid_n, fwd_n = FORMATION_OPTIONS[formation]
+
+    gk_options = unique_player_df(1)["id"].astype(int).tolist()
+    def_options = unique_player_df(2)["id"].astype(int).tolist()
+    mid_options = unique_player_df(3)["id"].astype(int).tolist()
+    fwd_options = unique_player_df(4)["id"].astype(int).tolist()
+
+    def choose_slots(title, options, count, key_prefix):
+        st.markdown(f"### {title}")
+        chosen = []
+        for i in range(count):
+            opts = [None] + [pid for pid in options if pid not in chosen]
+            pid = st.selectbox(
+                f"{title} {i+1}",
+                opts,
+                format_func=lambda x: "— اختر لاعبًا —" if x is None else player_option_label(x),
+                key=f"{key_prefix}_{i}"
+            )
+            if pid is not None:
+                chosen.append(pid)
+        return chosen
+
+    gk_ids = choose_slots("🧤 الحراسة", gk_options, 1, "my_gk")
+    def_ids = choose_slots("🛡️ الدفاع", def_options, def_n, "my_def")
+    mid_ids = choose_slots("🎯 الوسط", mid_options, mid_n, "my_mid")
+    fwd_ids = choose_slots("⚡ الهجوم", fwd_options, fwd_n, "my_fwd")
+
+    st.markdown("### 🪑 الدكة")
+    bench_gk_options = [x for x in gk_options if x not in gk_ids]
+    bench_outfield = [x for x in (def_options + mid_options + fwd_options)
+                      if x not in (def_ids + mid_ids + fwd_ids)]
+
+    bench1 = st.selectbox(
+        "الدكة 1 — حارس",
+        [None] + bench_gk_options,
+        format_func=lambda x: "— اختر الحارس الاحتياطي —" if x is None else player_option_label(x),
+        key="my_bench_gk"
+    )
+    used_bench = [bench1]
+    bench2_opts = [x for x in bench_outfield if x not in used_bench]
+    bench2 = st.selectbox(
+        "الدكة 2 — لاعب",
+        [None] + bench2_opts,
+        format_func=lambda x: "— اختر لاعبًا —" if x is None else player_option_label(x),
+        key="my_bench_2"
+    )
+    used_bench.append(bench2)
+    bench3_opts = [x for x in bench_outfield if x not in used_bench]
+    bench3 = st.selectbox(
+        "الدكة 3 — لاعب",
+        [None] + bench3_opts,
+        format_func=lambda x: "— اختر لاعبًا —" if x is None else player_option_label(x),
+        key="my_bench_3"
+    )
+    used_bench.append(bench3)
+    bench4_opts = [x for x in bench_outfield if x not in used_bench]
+    bench4 = st.selectbox(
+        "الدكة 4 — لاعب",
+        [None] + bench4_opts,
+        format_func=lambda x: "— اختر لاعبًا —" if x is None else player_option_label(x),
+        key="my_bench_4"
+    )
+
+    all_ids = [x for x in (
+        gk_ids + def_ids + mid_ids + fwd_ids + [bench1, bench2, bench3, bench4]
+    ) if x is not None]
+
+    if len(set(all_ids)) != 15:
+        st.warning(f"أكمل تشكيلتك إلى 15 لاعبًا. حاليًا: {len(set(all_ids))}/15")
+    else:
+        my_squad = df[df["id"].isin(all_ids)].drop_duplicates("id").copy()
+        my_xi_ids = [x for x in (gk_ids + def_ids + mid_ids + fwd_ids) if x is not None]
+        my_xi = my_squad[my_squad["id"].isin(my_xi_ids)].copy()
+
+        xi_options = my_xi["id"].astype(int).tolist()
+        cap_id = st.selectbox(
+            "👑 الكابتن", xi_options,
+            format_func=player_option_label,
+            key="my_captain"
+        )
+        vc_options = [x for x in xi_options if x != cap_id]
+        vc_id = st.selectbox(
+            "🥈 نائب الكابتن", vc_options,
+            format_func=player_option_label,
+            key="my_vc"
+        )
+
+        score, strengths, weaknesses = team_diagnosis(my_squad, my_xi)
+        captain_row = my_squad[my_squad.id == cap_id].iloc[0]
+        vc_row = my_squad[my_squad.id == vc_id].iloc[0]
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("قوة الفريق", f"{score:.0f}/100")
+        c2.metric("XI متوقع", f"{my_xi['النقاط_المتوقعة'].sum():.1f}")
+        c3.metric("متوسط التواجد", f"{my_squad['احتمال_البداية_والتواجد'].mean()*100:.0f}%")
+        c4.metric("مخاطرة القرار", f"{my_squad['مخاطرة_القرار'].mean():.0f}/100")
+
+        st.markdown('<div class="pitch">', unsafe_allow_html=True)
+        st.markdown(f'<div class="pitch-title">🏟️ تشكيلتك — {formation}</div>', unsafe_allow_html=True)
+        for title, typ in [("🧤 حراسة",1),("🛡️ دفاع",2),("🎯 وسط",3),("⚡ هجوم",4)]:
+            group = my_xi[my_xi.element_type == typ]
+            st.markdown(f'<div class="row-label">{title}</div>', unsafe_allow_html=True)
+            cols = st.columns(max(1, len(group)))
+            for j, (_, p) in enumerate(group.iterrows()):
+                tag = '<span class="capt">C</span>' if int(p.id) == int(cap_id) else (
+                    '<span class="vc">نائب</span>' if int(p.id) == int(vc_id) else ''
+                )
+                with cols[j]:
+                    st.markdown(
+                        f'''<div class="player">{shirt_svg(p.team_name)}
+                        <b>{html.escape(str(p.web_name))}</b> {tag}<br>
+                        <span>{html.escape(str(p.team_name))}</span><br>
+                        <span>£{p.price:.1f}م</span><br>
+                        <span class="good">{p.النقاط_المتوقعة:.2f} متوقعة</span>
+                        </div>''',
+                        unsafe_allow_html=True
+                    )
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        bench_ids = [x for x in [bench1, bench2, bench3, bench4] if x is not None]
+        my_bench = my_squad[my_squad["id"].isin(bench_ids)].copy()
+        st.markdown("### 🪑 دكة فريقك")
+        bcols = st.columns(4)
+        for j, (_, p) in enumerate(my_bench.iterrows()):
+            with bcols[j]:
+                st.markdown(
+                    f'''<div class="player">{shirt_svg(p.team_name)}
+                    <b>{html.escape(str(p.web_name))}</b><br>
+                    <span>{html.escape(str(p.team_name))}</span><br>
+                    <span class="good">{p.النقاط_المتوقعة:.2f} متوقعة</span><br>
+                    <span class="small">مخاطرة القرار: {p.مخاطرة_القرار:.0f}/100</span>
+                    </div>''',
+                    unsafe_allow_html=True
+                )
+
+        st.markdown("### 🧠 تشخيص Laithinho")
+        st.markdown("**💪 نقاط القوة**")
+        for s in strengths:
+            st.markdown(f"- {s}")
+        st.markdown("**⚠️ نقاط الضعف**")
+        for w in weaknesses:
+            st.markdown(f"- {w}")
+
+        st.markdown("### 👑 قرار الكابتن")
+        st.success(
+            f"**{captain_row.web_name}** هو الاختيار الحالي للنموذج: "
+            f"{captain_row.النقاط_المتوقعة:.2f} نقطة متوقعة، "
+            f"احتمال التواجد {captain_row.احتمال_البداية_والتواجد*100:.0f}%."
+        )
+        st.info(
+            f"النائب: **{vc_row.web_name}** — {vc_row.النقاط_المتوقعة:.2f} متوقعة. "
+            "لا يعتمد القرار على آخر جولة فقط."
+        )
+
+        st.markdown("### 🔧 من أضعف الأصول عندك؟")
+        weak = my_squad.sort_values(
+            ["النقاط_المتوقعة", "مخاطرة_القرار"],
+            ascending=[True, False]
+        ).head(4)
+        st.dataframe(
+            weak[[
+                "web_name","team_name","price","النقاط_المتوقعة","آخر5_متوسط",
+                "hist_ppg","احتمال_البداية_والتواجد","قوة_المباريات","مخاطرة_القرار"
+            ]],
+            column_config={
+                "web_name":"اللاعب","team_name":"الفريق","price":"السعر",
+                "النقاط_المتوقعة":"xP الجولة","آخر5_متوسط":"متوسط آخر 5",
+                "hist_ppg":"متوسط تاريخي","احتمال_البداية_والتواجد":"احتمال التواجد",
+                "قوة_المباريات":"قوة المباريات","مخاطرة_القرار":"مخاطرة القرار"
+            },
+            use_container_width=True,
+            hide_index=True
+        )
+
+        if st.checkbox(
+            "📰 افحص الأخبار المؤثرة على تشكيلتي الآن",
+            key="scan_my_team_news"
+        ):
+            with st.spinner("جاري فحص الأخبار للاعبين الأكثر حساسية في فريقك..."):
+                news_items = latest_team_news(my_squad)
+            if news_items:
+                for n in news_items:
+                    st.markdown(
+                        f'''<div class="card"><b>{html.escape(n["player"])} — {html.escape(n["title"])}</b><br>
+                        <span class="small">المصدر: {html.escape(n["source"])}</span><br>
+                        <a href="{html.escape(n["link"])}" target="_blank">فتح الخبر الأصلي</a></div>''',
+                        unsafe_allow_html=True
+                    )
+            else:
+                st.info("لم تظهر أخبار مؤثرة من نتائج البحث الحالية.")
+
+        st.caption(
+            "التقييم يجمع البيانات الحالية + آخر 5/10 جولات + 2024/25 و2025/26 + Home/Away + "
+            "الدقائق والبدايات + احتمالية المشاركة + قوة المباريات + DGW. "
+            "الأخبار تُفحص عند طلبك."
+        )
+
+# ------------------------------------------------------------
+# تبويب تحليل اللاعبين
+# ------------------------------------------------------------
+with tabs[2]:
     st.subheader("🔎 تحليل لاعب بالتفصيل")
     selected = st.selectbox("اختر اللاعب", sorted(df.web_name.dropna().unique()))
     p = df[df.web_name == selected].iloc[0]
@@ -638,7 +1013,7 @@ with tabs[1]:
 # ------------------------------------------------------------
 # تبويب المقارنة
 # ------------------------------------------------------------
-with tabs[2]:
+with tabs[3]:
     st.subheader("⚖️ مقارنة لاعبين")
     names = sorted(df.web_name.dropna().unique())
     a = st.selectbox("اللاعب الأول", names, key="cmp_a")
@@ -673,7 +1048,7 @@ with tabs[2]:
 # ------------------------------------------------------------
 # تبويب البطاقات
 # ------------------------------------------------------------
-with tabs[3]:
+with tabs[4]:
     st.subheader("🃏 مستشار البطاقات")
 
     bench = squad[~squad.index.isin(xi.index)] if not squad.empty else pd.DataFrame()
@@ -704,7 +1079,7 @@ with tabs[3]:
 # ------------------------------------------------------------
 # تبويب الأخبار
 # ------------------------------------------------------------
-with tabs[4]:
+with tabs[5]:
     st.subheader("📰 مركز الأخبار")
     st.write("ابحث عن لاعب أو فريق لمراجعة الأخبار التي قد تؤثر على قرار FPL.")
     news_player = st.selectbox("اللاعب", sorted(df.web_name.dropna().unique()), key="news_player")
@@ -729,7 +1104,7 @@ with tabs[4]:
 # ------------------------------------------------------------
 # تبويب السجل التاريخي
 # ------------------------------------------------------------
-with tabs[5]:
+with tabs[6]:
     st.subheader("📚 السجل التاريخي")
     if history.empty:
         st.warning("لم تُحمّل البيانات التاريخية.")
@@ -756,7 +1131,7 @@ with tabs[5]:
 # ------------------------------------------------------------
 # تبويب المحادثة
 # ------------------------------------------------------------
-with tabs[6]:
+with tabs[7]:
     st.subheader("💬 تحدث مع Laithinho")
 
     if "chat" not in st.session_state:
