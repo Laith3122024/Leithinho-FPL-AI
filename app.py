@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-Laithinho FPL AI V6.5.2 — Strategy Engine
+Laithinho FPL AI V6.4 — Match Brain
 نسخة عربية متكاملة — إصلاح أخطاء البيانات التاريخية:
 - بيانات FPL الحالية
 - آخر الجولات
@@ -483,8 +483,6 @@ def add_match_aware_player_projection(frame):
     xa90=np.clip(np.where(cur_xa90>0,.65*cur_xa90+.35*hist_xa90,hist_xa90),0,.9)
     out["xA_الجولة_القادمة"]=np.clip(xa90*(90* out["احتمال_البداية_والتواجد"])/90.0,0,0.9)
 
-    # مهم: احتمال البداية وليس مجرد احتمال التواجد.
-    # status=a يعني أن اللاعب متاح، لكنه لا يعني أنه سيبدأ.
     minutes_factor=out["احتمال_البداية_والتواجد"].clip(0,1)
     cs=out["احتمال_كلين_شيت"].clip(0,1)
     expected_minutes=90*minutes_factor
@@ -714,41 +712,6 @@ def availability_profile(row):
         label = "🟢 متاح مبدئيًا"
         severity = 0.0
 
-    # ===== V6.4.3: نفصل بين availability و starting probability =====
-    # chance_of_playing_next_round يخبرنا هل اللاعب متاح، وليس هل سيبدأ.
-    # لذلك لاعب متاح لكنه احتياطي لا يحصل على 90 دقيقة افتراضية.
-    completed = max(int(prediction_gw) - 1, 1)
-    starts = float(pd.to_numeric(pd.Series([row.get("starts", 0)]), errors="coerce").fillna(0).iloc[0])
-    minutes = float(pd.to_numeric(pd.Series([row.get("minutes", 0)]), errors="coerce").fillna(0).iloc[0])
-    hist_starts = float(pd.to_numeric(pd.Series([row.get("hist_starts", 0)]), errors="coerce").fillna(0).iloc[0])
-    hist_gws = float(pd.to_numeric(pd.Series([row.get("hist_gws", 0)]), errors="coerce").fillna(0).iloc[0])
-
-    current_start_rate = np.clip(starts / completed, 0, 1)
-    current_min_rate = np.clip(minutes / (completed * 90.0), 0, 1)
-    historical_start_rate = np.clip(hist_starts / max(hist_gws, 1), 0, 1)
-
-    if starts > 0:
-        start_prob = 0.62 * current_start_rate + 0.23 * current_min_rate + 0.15 * historical_start_rate
-    else:
-        # لا يوجد بدء هذا الموسم حتى الآن: التاريخ يساعد، لكن لا يجوز أن
-        # يعامل اللاعب كأنه أساسي تلقائيًا.
-        start_prob = 0.35 * current_min_rate + 0.65 * historical_start_rate
-        if minutes < 60:
-            start_prob *= 0.65
-
-    # إذا كان متاحًا لكن بدأ GW1 من الدكة، نخفض التوقع أكثر؛ هذه بالضبط
-    # الحالة التي كانت تسمح لـWelbeck/أي لاعب بديل بتجاوز الأساسيين.
-    if completed >= 1 and starts == 0 and minutes < 75:
-        start_prob *= 0.55
-
-    availability_factor = next_pct / 100.0
-    if next_pct < 50:
-        start_prob *= availability_factor
-    elif next_pct < 75:
-        start_prob *= 0.80 + 0.20 * availability_factor
-
-    start_prob = float(np.clip(start_prob, 0.03, 0.98))
-
     news_text = str(row.get("news", "") or "").lower()
     long_terms = [
         "long term", "long-term", "for months", "months", "surgery",
@@ -760,7 +723,7 @@ def availability_profile(row):
     return pd.Series({
         "نسبة_التواجد_القادمة": next_pct / 100.0,
         "نسبة_التواجد_الحالية": this_pct / 100.0,
-        "احتمال_البداية_والتواجد": start_prob,
+        "احتمال_البداية_والتواجد": np.clip((next_pct * .70 + this_pct * .30) / 100.0, 0, 1),
         "حالة_التوفر": label,
         "غياب_طويل_أو_غير_محدد": bool(long_absence),
         "شدة_الغياب": severity,
@@ -1187,168 +1150,49 @@ df = pd.concat([df, ownership], axis=1)
 # ============================================================
 # تحسين الفريق
 # ============================================================
-def build_strategy_squad(budget, strategy="safe", exclude_ids=None):
-    """بناء فريق كامل حسب استراتيجية FPL مختلفة.
-
-    safe      = أعلى استقرار + ملكية عالية + احتمال بداية قوي.
-    balanced  = أفضل مزيج بين xP والأمان والديفرنتشال.
-    differential = يرفع قيمة الخيارات منخفضة الملكية عندما تكون بياناتها قوية.
-
-    مهم: الملكية لا تغيّر النقاط المتوقعة نفسها؛ هي طبقة قرار استراتيجية فقط.
-    """
-    required = [
-        "price", "حالة_التوفر", "غياب_طويل_أو_غير_محدد", "id",
-        "احتمال_البداية_والتواجد", "ملكية_اللاعب", "درجة_الديفرنتشال",
-        "قوة_المباريات", "سقف_النقاط_التقديري", "النقاط_المتوقعة",
-        "element_type", "team"
-    ]
-    if any(c not in df.columns for c in required):
-        return pd.DataFrame()
-
-    d = df[(pd.to_numeric(df["price"], errors="coerce") > 0)].copy()
-    d["price"] = pd.to_numeric(d["price"], errors="coerce").fillna(0.0)
+def optimize_squad(budget):
+    # التشكيلة المثالية لا تختار لاعبًا غير متاح طويلًا.
+    # اللاعب المشكوك بمشاركته قد يدخل إذا بقيت قيمته قوية، لكن اللاعب
+    # المصاب/الموقوف/غير المتاح 0% لا يدخل في الـ15 المثالية.
+    d = df[(df["price"] > 0)].copy()
     d = d[~((d["حالة_التوفر"] == "🔴 غير متاح") | (d["غياب_طويل_أو_غير_محدد"] == True))]
-
-    if exclude_ids:
-        d = d[~d["id"].isin(list(exclude_ids))]
-
-    for c in [
-        "احتمال_البداية_والتواجد", "ملكية_اللاعب", "درجة_الديفرنتشال",
-        "قوة_المباريات", "سقف_النقاط_التقديري", "النقاط_المتوقعة"
-    ]:
-        d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0)
-
-    starter = d["احتمال_البداية_والتواجد"].clip(0, 1)
-    own = d["ملكية_اللاعب"].clip(0, 100) / 100.0
-    diff = d["درجة_الديفرنتشال"].clip(0, 100) / 100.0
-    fixture = d["قوة_المباريات"].clip(0, 1)
-    ceiling = d["سقف_النقاط_التقديري"].clip(0, 28) / 4.0
-
-    # أساس موحّد: التوقع الرياضي + الدقائق/البداية + السقف.
-    base = (
-        d["النقاط_المتوقعة"] * (0.56 + 0.44 * starter)
-        + 0.20 * ceiling
-    )
-
-    if strategy == "safe":
-        # Template/Safe: لا نكافئ الملكية بشكل مباشر على xP، بل نستخدمها
-        # كأفضلية قرار عند تساوي اللاعبين تقريبًا.
-        score = base + 0.55 * own + 0.20 * fixture
-    elif strategy == "differential":
-        # Differential: لا يكفي أن تكون الملكية منخفضة؛ يجب أن يكون xP
-        # والبداية والمباراة جيدين حتى يحصل اللاعب على مكافأة.
-        low_own_gate = np.clip((0.22 - own) / 0.22, 0, 1)
-        score = base + 0.70 * diff * low_own_gate + 0.30 * fixture
-    else:
-        # Balanced: خليط بين الأمان والديفرنتشال.
-        low_own_gate = np.clip((0.30 - own) / 0.30, 0, 1)
-        score = base + 0.24 * own + 0.42 * diff * low_own_gate + 0.25 * fixture
-
-    d["قيمة_اختيار_التشكيلة"] = score
-
-    # اللاعب الذي لديه دليل ضعيف على البداية لا يجب أن يهزم أساسيًا قويًا.
-    d["قيمة_اختيار_التشكيلة"] -= np.where(starter < 0.45, 2.2, 0.0)
-    d["قيمة_اختيار_التشكيلة"] -= np.where(starter < 0.30, 2.0, 0.0)
-
-    # نخلي قائمة المرشحين واسعة حتى لا يختفي differential جيد بسبب ترتيب أولي ضيق.
-    d = d.sort_values(["قيمة_اختيار_التشكيلة", "النقاط_المتوقعة"], ascending=False).head(800)
+    d = d.sort_values("النقاط_المتوقعة", ascending=False).head(450)
     ids = d.index.tolist()
-    if len(ids) < 15:
-        return pd.DataFrame()
 
-    prob = pulp.LpProblem(f"Laithinho_{strategy}", pulp.LpMaximize)
+    prob = pulp.LpProblem("Laithinho", pulp.LpMaximize)
     x = pulp.LpVariable.dicts("اختيار", ids, cat="Binary")
 
-    prob += pulp.lpSum(d.loc[i, "قيمة_اختيار_التشكيلة"] * x[i] for i in ids)
+    prob += pulp.lpSum(d.loc[i, "النقاط_المتوقعة"] * x[i] for i in ids)
     prob += pulp.lpSum(x[i] for i in ids) == 15
     prob += pulp.lpSum(d.loc[i, "price"] * x[i] for i in ids) <= budget
 
-    for typ, n in [(1, 2), (2, 5), (3, 5), (4, 3)]:
-        prob += pulp.lpSum(x[i] for i in ids if int(d.loc[i, "element_type"]) == typ) == n
+    for typ, n in [(1,2),(2,5),(3,5),(4,3)]:
+        prob += pulp.lpSum(x[i] for i in ids if int(d.loc[i,"element_type"]) == typ) == n
 
     for tid in d["team"].unique():
-        prob += pulp.lpSum(x[i] for i in ids if d.loc[i, "team"] == tid) <= 3
+        prob += pulp.lpSum(x[i] for i in ids if d.loc[i,"team"] == tid) <= 3
 
     status = prob.solve(pulp.PULP_CBC_CMD(msg=False))
     if pulp.LpStatus[status] != "Optimal":
         return pd.DataFrame()
 
-    selected = [i for i in ids if x[i].value() == 1]
-    return d.loc[selected].copy()
-
+    return d.loc[[i for i in ids if x[i].value() == 1]].copy()
 
 def best_xi(squad):
-    # التشكيلة الأساسية يجب أن تفضّل المتوقع أن يبدأ، وليس مجرد أعلى xP نظري.
     best = pd.DataFrame()
-    best_score = -1e9
-    if squad.empty:
-        return best
-    starter = squad["احتمال_البداية_والتواجد"].clip(0, 1)
-    squad = squad.copy()
-    squad["درجة_الأساسي"] = (
-        squad["النقاط_المتوقعة"] * (0.55 + 0.45 * starter)
-        + 0.20 * squad["سقف_النقاط_التقديري"].clip(0, 28) / 4.0
-    )
+    best_score = -1
     for dn, mn, fn in [(3,4,3),(3,5,2),(4,4,2),(4,3,3),(5,4,1),(5,3,2)]:
-        de = squad[squad.element_type == 2].nlargest(dn, "درجة_الأساسي")
-        mi = squad[squad.element_type == 3].nlargest(mn, "درجة_الأساسي")
-        fw = squad[squad.element_type == 4].nlargest(fn, "درجة_الأساسي")
-        gk = squad[squad.element_type == 1].nlargest(1, "درجة_الأساسي")
-        if len(de) == dn and len(mi) == mn and len(fw) == fn and len(gk) == 1:
+        de = squad[squad.element_type == 2].nlargest(dn, "النقاط_المتوقعة")
+        mi = squad[squad.element_type == 3].nlargest(mn, "النقاط_المتوقعة")
+        fw = squad[squad.element_type == 4].nlargest(fn, "النقاط_المتوقعة")
+        gk = squad[squad.element_type == 1].nlargest(1, "النقاط_المتوقعة")
+        if len(de) == dn and len(mi) == mn and len(fw) == fn:
             z = pd.concat([gk,de,mi,fw])
-            score = z["درجة_الأساسي"].sum()
+            score = z["النقاط_المتوقعة"].sum()
             if score > best_score:
                 best_score = score
                 best = z
     return best
-
-
-def strategy_summary(team, xi):
-    if team.empty or xi.empty:
-        return {"expected": 0.0, "diffs": 0, "risk": 100.0, "formation": "—"}
-    expected = float(xi["النقاط_المتوقعة"].sum())
-    diffs = int((xi["ملكية_اللاعب"] <= 10).sum())
-    start = float(xi["احتمال_البداية_والتواجد"].mean())
-    ownership = float(xi["ملكية_اللاعب"].mean())
-    risk = float(np.clip(100 - (start * 55 + ownership / 2), 0, 100))
-    g = int((xi.element_type == 2).sum())
-    m = int((xi.element_type == 3).sum())
-    f = int((xi.element_type == 4).sum())
-    return {"expected": expected, "diffs": diffs, "risk": risk, "formation": f"{g}-{m}-{f}"}
-
-# ============================================================
-# ثلاث استراتيجيات: Safe / Balanced / Differential
-# ============================================================
-def safe_build_strategy(budget_value, strategy_name):
-    """غلاف آمن لمحرك التشكيلات.
-    يمنع أي خطأ داخل استراتيجية واحدة من إسقاط التطبيق كاملًا.
-    """
-    try:
-        result = build_strategy_squad(float(budget_value), str(strategy_name))
-        if isinstance(result, pd.DataFrame):
-            return result.copy()
-    except Exception:
-        # لا نعرض traceback للمستخدم، لكن نُبقي التطبيق قابلًا للتشغيل.
-        pass
-    return pd.DataFrame()
-
-safe_squad = safe_build_strategy(budget, "safe")
-balanced_squad = safe_build_strategy(budget, "balanced")
-differential_squad = safe_build_strategy(budget, "differential")
-
-safe_xi = best_xi(safe_squad)
-balanced_xi = best_xi(balanced_squad)
-differential_xi = best_xi(differential_squad)
-
-strategy_data = {
-    "safe": ("🟢 التشكيلة الآمنة", safe_squad, safe_xi, "أعلى استقرار وملكية؛ مناسبة لحماية الـRank."),
-    "balanced": ("🔵 التشكيلة المتوازنة", balanced_squad, balanced_xi, "مزيج بين الأمان والديفرنتشال؛ الخيار الافتراضي المفضل."),
-    "differential": ("🔴 تشكيلة الـDifferentials", differential_squad, differential_xi, "تقبل مخاطرة أعلى بحثًا عن مكاسب كبيرة في الـRank."),
-}
-
-# التشكيلة الأساسية للعرض الافتراضي هي المتوازنة.
-squad = balanced_squad
-xi = balanced_xi
 
 # ============================================================
 # هوية قمصان الفرق
@@ -1559,23 +1403,14 @@ tabs = st.tabs([
     "💬 Laithinho"
 ])
 
+squad = optimize_squad(budget)
+xi = best_xi(squad)
 
 # ------------------------------------------------------------
 # تبويب الفريق
 # ------------------------------------------------------------
 with tabs[0]:
-    st.subheader(f"🏟️ تشكيلات Laithinho الثلاث — الجولة {prediction_gw}")
-
-    st.markdown("### 🧠 ثلاث طرق للعب")
-    summary_cols = st.columns(3)
-    for col, key in zip(summary_cols, ["safe", "balanced", "differential"]):
-        title, team_s, xi_s, desc = strategy_data[key]
-        sm = strategy_summary(team_s, xi_s)
-        with col:
-            st.markdown(f"**{title}**")
-            st.metric("النقاط المتوقعة", f"{sm['expected']:.1f}")
-            st.write(f"تشكيلة: **{sm['formation']}** · Differentials: **{sm['diffs']}**")
-            st.caption(desc)
+    st.subheader(f"🏟️ تشكيلة Laithinho المقترحة — الجولة {prediction_gw}")
 
     st.markdown("### 🗓️ تحليل المباريات القادمة")
     if not match_predictions.empty:
@@ -1604,31 +1439,21 @@ with tabs[0]:
             st.markdown("**🔥 Differentials محتملة**")
             st.dataframe(diff[["web_name","team_name","ملكية_اللاعب","النقاط_المتوقعة","درجة_الديفرنتشال","قرار_الملكية"]], use_container_width=True, hide_index=True)
 
-    def render_recommended_team(title, team_s, xi_s, description):
-        st.markdown(f"## {title}")
-        st.caption(description)
-        if xi_s.empty:
-            st.error("لم أستطع بناء هذه التشكيلة بهذه الميزانية والقيود الحالية.")
-            return
-        captain = xi_s.nlargest(1, "النقاط_المتوقعة").iloc[0]
-        vice = xi_s.nlargest(2, "النقاط_المتوقعة").iloc[1]
-        sm = strategy_summary(team_s, xi_s)
-        m1,m2,m3,m4 = st.columns(4)
-        m1.metric("متوقع XI", f"{sm['expected']:.1f}")
-        m2.metric("التشكيلة", sm["formation"])
-        m3.metric("Differentials", sm["diffs"])
-        m4.metric("مخاطرة القرار", f"{sm['risk']:.0f}/100")
+    if xi.empty:
+        st.error("لم أستطع بناء تشكيلة بهذه الميزانية.")
+    else:
+        captain = xi.nlargest(1, "النقاط_المتوقعة").iloc[0]
+        vice = xi.nlargest(2, "النقاط_المتوقعة").iloc[1]
 
         st.markdown('<div class="pitch">', unsafe_allow_html=True)
-        for title_pos, typ in [("🧤 حراسة",1),("🛡️ دفاع",2),("🎯 وسط",3),("⚡ هجوم",4)]:
-            group = xi_s[xi_s.element_type == typ]
-            st.markdown(f"### {title_pos}")
+        for title, typ in [("🧤 حراسة",1),("🛡️ دفاع",2),("🎯 وسط",3),("⚡ هجوم",4)]:
+            group = xi[xi.element_type == typ]
+            st.markdown(f"### {title}")
             cols = st.columns(max(1,len(group)))
             for j, (_, p) in enumerate(group.iterrows()):
                 tag = '<span class="capt">C</span>' if p.id == captain.id else (
                     '<span class="vc">نائب</span>' if p.id == vice.id else ""
                 )
-                ownership_tag = str(p["تصنيف_الملكية"])
                 with cols[j]:
                     st.markdown(
                         f"""<div class="player">
@@ -1637,38 +1462,29 @@ with tabs[0]:
                         <span>{html.escape(str(p.team_name))}</span><br>
                         <span>£{p.price:.1f}م</span><br>
                         <span class="good">{p.النقاط_المتوقعة:.2f} متوقعة</span><br>
-                        <span class="small">ملكية {p.ملكية_اللاعب:.1f}% · {ownership_tag} · بداية {p.احتمال_البداية_والتواجد*100:.0f}%</span>
+                        <span class="small">ملكية {p.ملكية_اللاعب:.1f}% · {p.تصنيف_الملكية}</span>
                         </div>""",
                         unsafe_allow_html=True
                     )
         st.markdown("</div>", unsafe_allow_html=True)
 
-        bench = team_s[~team_s.index.isin(xi_s.index)].sort_values("النقاط_المتوقعة", ascending=False)
+        bench = squad[~squad.index.isin(xi.index)].sort_values("النقاط_المتوقعة", ascending=False)
         st.markdown("### 🪑 الدكة")
         cols = st.columns(4)
         for j, (_, p) in enumerate(bench.iterrows()):
             with cols[j]:
                 st.markdown(
                     f"""<div class="player">{shirt_svg(p.team_name)}
-                    <b>{html.escape(str(p.web_name))}</b><br><span>{html.escape(str(p.team_name))}</span><br>
-                    <span class="good">{p.النقاط_المتوقعة:.2f} متوقعة</span><br>
-                    <span class="small">بداية {p.احتمال_البداية_والتواجد*100:.0f}% · ملكية {p.ملكية_اللاعب:.1f}%</span></div>""",
+                    <b>{p.web_name}</b><br><span>{p.team_name}</span><br>
+                    <span class="good">{p.النقاط_المتوقعة:.2f} متوقعة</span></div>""",
                     unsafe_allow_html=True
                 )
 
-    # عرض التشكيلات الثلاث منفصلة حتى لا تختلط على المستخدم.
-    render_recommended_team(*strategy_data["safe"])
-    st.divider()
-    render_recommended_team(*strategy_data["balanced"])
-    st.divider()
-    render_recommended_team(*strategy_data["differential"])
-
-    st.markdown("### 🧠 كيف أختار بينهم؟")
-    st.info(
-        "🟢 الآمنة لحماية الترتيب، 🔵 المتوازنة هي الاختيار الافتراضي، "
-        "🔴 الـDifferentials لمطاردة قفزة في الـRank. الملكية لا تزيد النقاط المتوقعة؛ "
-        "هي فقط تغيّر استراتيجية الاختيار."
-    )
+        st.markdown("### 🧠 لماذا هذه التشكيلة؟")
+        st.write(
+            "الاختيار يجمع بين توقع المباراة القادمة، xG الفريق، Clean Sheet، Home/Away، "
+            "الإنتاج الحالي، آخر 5 و10 جولات، السجل التاريخي، الدقائق والبدايات، احتمالية المشاركة وDGW."
+        )
 
 # ------------------------------------------------------------
 # تبويب تشكيلتي الشخصية
