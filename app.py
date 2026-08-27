@@ -1,8 +1,8 @@
 
 # -*- coding: utf-8 -*-
 """
-Laithinho FPL AI V5
-نسخة عربية متكاملة:
+Laithinho FPL AI V5.1
+نسخة عربية متكاملة — إصلاح أخطاء البيانات التاريخية:
 - بيانات FPL الحالية
 - آخر الجولات
 - تاريخ المواسم السابقة
@@ -245,17 +245,52 @@ def historical_player_stats(name):
 # نبني الإحصاءات التاريخية مرة واحدة للاعبين الموجودين حاليًا.
 @st.cache_data(ttl=21600)
 def build_history_summary(current_names):
+    # مهم: web_name قد يتكرر بين أكثر من لاعب، وSeries.map()
+    # يسبب InvalidIndexError إذا كان فهرس المصدر يحتوي أسماء مكررة.
+    # لذلك نبني قاموسًا بمفتاح فريد لكل اسم.
+    unique_names = sorted({
+        str(x).strip() for x in current_names
+        if pd.notna(x) and str(x).strip()
+    })
+
     rows = []
-    for name in current_names:
+    for name in unique_names:
         s = historical_player_stats(name)
         s["name"] = name
         rows.append(s)
-    return pd.DataFrame(rows).set_index("name")
+
+    if not rows:
+        return pd.DataFrame()
+
+    summary = pd.DataFrame(rows)
+
+    # حماية إضافية من أي تكرار غير متوقع في الاسم.
+    summary = summary.drop_duplicates(subset=["name"], keep="first")
+    return summary.set_index("name")
 
 history_summary = build_history_summary(tuple(df["web_name"].fillna("").tolist()))
 
-for c in history_summary.columns:
-    df[c] = df["web_name"].map(history_summary[c]).fillna(0)
+# نستخدم merge بدل Series.map حتى لا يحدث InvalidIndexError
+# وحتى يبقى لكل صف في جدول اللاعبين الحالي صفه الأصلي.
+if not history_summary.empty:
+    hist_reset = history_summary.reset_index()
+    df = df.merge(
+        hist_reset,
+        how="left",
+        left_on="web_name",
+        right_on="name",
+        suffixes=("", "_history")
+    )
+    if "name" in df.columns:
+        df = df.drop(columns=["name"])
+
+for c in [
+    "hist_points", "hist_ppg", "hist_minutes", "hist_starts",
+    "hist_xgi", "hist_home", "hist_away", "hist_gws"
+]:
+    if c not in df.columns:
+        df[c] = 0
+    df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
 # ============================================================
 # آخر الجولات
@@ -314,8 +349,8 @@ chance_next = df["chance_of_playing_next_round"].replace(0, 100).clip(0,100) / 1
 chance_this = df["chance_of_playing_this_round"].replace(0, 100).clip(0,100) / 100
 df["احتمال_البداية_والتواجد"] = ((chance_next + chance_this) / 2).clip(.05,1)
 
-df["قوة_المباريات"] = df["team"].map(fixture_strength)
-df["عدد_DGW"] = df["team"].map(dgw_count)
+df["قوة_المباريات"] = df["team"].apply(lambda tid: fixture_strength(tid))
+df["عدد_DGW"] = df["team"].apply(lambda tid: dgw_count(tid))
 
 # لا نسمح للجولة الماضية أن تهيمن.
 df["الأساس"] = (
