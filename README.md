@@ -1,16 +1,70 @@
-# Leithinho FPL AI
+# Laithinho FPL AI V5 — النسخة العربية المتكاملة
 
-A Streamlit FPL assistant using official FPL data, fixtures, a mathematical squad optimizer, and public news/RSS intelligence.
+## ماذا أضافت V5؟
 
-## Files
+- بيانات FPL الحالية.
+- آخر 5 و10 جولات.
+- سجل تاريخي من موسمي 2024/25 و2025/26.
+- Home/Away للمباريات القادمة.
+- Home/Away تاريخي عندما تتوفر بيانات اللاعب.
+- احتمال التواجد/المشاركة.
+- تحليل الدقائق والبدايات.
+- DGW.
+- "مخاطرة القرار" وليست تقييمًا لشخصية أو جودة اللاعب.
+- مقارنة لاعبين.
+- تحليل تشكيلة ودكة.
+- مستشار Wildcard / Free Hit / Bench Boost / Triple Captain.
+- أخبار اللاعب.
+- واجهة عربية بالكامل.
+- واجهة محادثة عربية.
 
-- `app.py` — application
-- `requirements.txt` — Python dependencies
+## مصدر البيانات التاريخية
 
-## Deploy
+تستخدم النسخة ملفات GW التاريخية من مستودع Vaastav/Fantasy-Premier-League على GitHub.
 
-Deploy the repository on Streamlit Community Cloud and select `app.py` as the entrypoint.
+المسارات المستخدمة:
+- data/2025-26/gws/merged_gw.csv
+- data/2024-25/gws/merged_gw.csv
 
-## Important
+إذا تغيرت بنية المستودع أو الرابط، عدّل HIST_URLS في app.py.
 
-The news layer uses public RSS/Google News RSS rather than fragile scraping of social platforms. Social links are provided for direct verification. Direct X/Instagram/Facebook/YouTube API ingestion can be added later with the relevant official API credentials.
+## تشغيل محلي
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+## النشر
+
+ارفع:
+- app.py
+- requirements.txt
+- README.md
+
+إلى نفس GitHub Repository الذي تستخدمه في Streamlit Community Cloud.
+
+## ملاحظة مهمة عن ML
+
+V5 ليست Machine Learning مدربًا بعد.
+هي Data-driven engine يدمج:
+- الحالة الحالية
+- آخر الجولات
+- التاريخ
+- Home/Away
+- الدقائق والبدايات
+- قوة المباريات
+- DGW
+- احتمالية المشاركة
+
+المرحلة القادمة الصحيحة:
+
+1. إنشاء dataset تدريب من Gameweek t.
+2. منع تسرب المستقبل (لا نستخدم أي معلومة ظهرت بعد deadline).
+3. الهدف = نقاط Gameweek التالية.
+4. نموذج أولي مثل LightGBM/XGBoost أو HistGradientBoosting.
+5. نموذج منفصل لاحتمال البداية.
+6. Backtesting موسمًا بموسم.
+7. مقارنة ML مع baseline بسيط.
+8. معايرة احتمالات البداية.
+9. إدخال الأخبار والإصابات كمميزات إضافية.
