@@ -364,9 +364,46 @@ df["recent10_n"] = normalize(df["آخر10_متوسط"])
 df["minutes_n"] = (df["minutes"] / max(float(df["minutes"].max()), 1)).clip(0, 1)
 df["starts_n"] = (df["starts"] / max(float(df["starts"].max()), 1)).clip(0, 1)
 
-chance_next = df["chance_of_playing_next_round"].replace(0, 100).clip(0,100) / 100
-chance_this = df["chance_of_playing_this_round"].replace(0, 100).clip(0,100) / 100
-df["احتمال_البداية_والتواجد"] = ((chance_next + chance_this) / 2).clip(.05,1)
+# مهم جدًا: لا نحول 0% إلى 100%.
+# في بيانات FPL، الصفر قد يعني أن اللاعب غير متاح فعلًا.
+# نعامل القيمة المفقودة فقط كـ"غير مُقيّمة"، ونستفيد من status لتثبيت القرار.
+def availability_profile(row):
+    status = str(row.get("status", "")).lower()
+    raw_next = pd.to_numeric(pd.Series([row.get("chance_of_playing_next_round")]), errors="coerce").iloc[0]
+    raw_this = pd.to_numeric(pd.Series([row.get("chance_of_playing_this_round")]), errors="coerce").iloc[0]
+
+    next_pct = 100.0 if pd.isna(raw_next) and status == "a" else (0.0 if pd.isna(raw_next) else float(np.clip(raw_next, 0, 100)))
+    this_pct = 100.0 if pd.isna(raw_this) and status == "a" else (0.0 if pd.isna(raw_this) else float(np.clip(raw_this, 0, 100)))
+
+    if status in {"i", "s", "u"} or next_pct <= 0:
+        label = "🔴 غير متاح"
+        severity = 1.0
+    elif status == "d" or next_pct < 75:
+        label = "🟡 مشكوك بمشاركته"
+        severity = 0.55
+    else:
+        label = "🟢 متاح مبدئيًا"
+        severity = 0.0
+
+    news_text = str(row.get("news", "") or "").lower()
+    long_terms = [
+        "long term", "long-term", "for months", "months", "surgery",
+        "out until", "out for", "several weeks", "weeks", "weeks out",
+        "set to miss", "ruled out for the season"
+    ]
+    long_absence = (status in {"i", "u"} and next_pct <= 25) or any(k in news_text for k in long_terms)
+
+    return pd.Series({
+        "نسبة_التواجد_القادمة": next_pct / 100.0,
+        "نسبة_التواجد_الحالية": this_pct / 100.0,
+        "احتمال_البداية_والتواجد": np.clip((next_pct * .70 + this_pct * .30) / 100.0, 0, 1),
+        "حالة_التوفر": label,
+        "غياب_طويل_أو_غير_محدد": bool(long_absence),
+        "شدة_الغياب": severity,
+    })
+
+avail = df.apply(availability_profile, axis=1)
+df = pd.concat([df, avail], axis=1)
 
 df["قوة_المباريات"] = df["team"].apply(lambda tid: fixture_strength(tid))
 df["عدد_DGW"] = df["team"].apply(lambda tid: dgw_count(tid))
@@ -383,7 +420,8 @@ df["الأساس"] = (
     .09 * df["recent5_n"] +
     .05 * df["recent10_n"] +
     .06 * df["hist_ppg_n"] +
-    .04 * df["hist_xgi_n"]
+    .04 * df["hist_xgi_n"] +
+    .07 * df["احتمال_البداية_والتواجد"]
 )
 
 df["النقاط_المتوقعة"] = (
@@ -393,6 +431,14 @@ df["النقاط_المتوقعة"] = (
         .10 * df["قوة_المباريات"].clip(0,1)
     )
 ).clip(.2, 13)
+
+# availability gate: اللاعب غير المتاح أو الغائب طويلًا لا يجوز أن
+# ينافس اللاعب المتاح في الاختيار النهائي. لا نحذف اللاعب من التحليل،
+# بل نُبقيه ظاهرًا مع عقوبة قوية على التوقع.
+df["النقاط_المتوقعة"] *= (
+    .05 + .95 * df["احتمال_البداية_والتواجد"].clip(0,1)
+)
+df.loc[df["غياب_طويل_أو_غير_محدد"], "النقاط_المتوقعة"] *= 0.15
 
 # DGW bonus محدود ومشروط بالمشاركة.
 df["النقاط_المتوقعة"] += df["عدد_DGW"].clip(0,2) * (
@@ -410,7 +456,8 @@ df["مخاطرة_القرار"] = np.clip(
         .22 * (1 - df["starts_n"]) +
         .18 * (1 - df["minutes_n"]) +
         .14 * (1 - df["hist_ppg_n"]) +
-        .14 * (1 - df["قوة_المباريات"].clip(0,1))
+        .14 * (1 - df["قوة_المباريات"].clip(0,1)) +
+        .20 * df["شدة_الغياب"]
     ),
     0, 100
 )
@@ -610,6 +657,13 @@ if ml_bundle is not None:
         0.65 * df["النقاط_المتوقعة_قبل_ML"] +
         0.35 * df["توقع_ML"]
     ).clip(.2, 15)
+
+    # طبقة التوفر تطبق مرة أخيرة بعد دمج ML حتى لا يستطيع النموذج
+    # رفع لاعب مصاب/غائب طويلًا إلى ترتيب مضلل.
+    df["النقاط_المتوقعة"] *= (
+        .05 + .95 * df["احتمال_البداية_والتواجد"].clip(0,1)
+    )
+    df.loc[df["غياب_طويل_أو_غير_محدد"], "النقاط_المتوقعة"] *= 0.15
 else:
     df["توقع_ML"] = np.nan
     ml_info = {"trained": False, "rows": 0, "mae": None, "seasons": []}
@@ -618,7 +672,11 @@ else:
 # تحسين الفريق
 # ============================================================
 def optimize_squad(budget):
-    d = df[(df["price"] > 0) & (df["status"].isin(["a","d","i","n"]))].copy()
+    # التشكيلة المثالية لا تختار لاعبًا غير متاح طويلًا.
+    # اللاعب المشكوك بمشاركته قد يدخل إذا بقيت قيمته قوية، لكن اللاعب
+    # المصاب/الموقوف/غير المتاح 0% لا يدخل في الـ15 المثالية.
+    d = df[(df["price"] > 0)].copy()
+    d = d[~((d["حالة_التوفر"] == "🔴 غير متاح") | (d["غياب_طويل_أو_غير_محدد"] == True))]
     d = d.sort_values("النقاط_المتوقعة", ascending=False).head(450)
     ids = d.index.tolist()
 
@@ -783,7 +841,8 @@ def team_quality_score(my_squad, my_xi):
     if my_squad.empty or my_xi.empty:
         return 0.0
     xi_avg = float(my_xi["النقاط_المتوقعة"].mean())
-    availability = float(my_squad["احتمال_البداية_والتواجد"].mean())
+    available_mask = my_squad["حالة_التوفر"] != "🔴 غير متاح"
+    availability = float(my_squad.loc[available_mask, "احتمال_البداية_والتواجد"].mean()) if available_mask.any() else 0.0
     recent = float(normalize(my_squad["آخر5_متوسط"]).mean())
     hist = float(normalize(my_squad["hist_ppg"]).mean())
     fixture = float(my_squad["قوة_المباريات"].clip(0,1).mean())
@@ -813,6 +872,15 @@ def team_diagnosis(my_squad, my_xi):
     weak_count = int((my_squad["مخاطرة_القرار"] >= 60).sum())
     if weak_count:
         weaknesses.append(f"هناك {weak_count} لاعب/لاعبين بقرار مرتفع المخاطرة.")
+    unavailable = int((my_squad["حالة_التوفر"] == "🔴 غير متاح").sum())
+    long_absent = int(my_squad["غياب_طويل_أو_غير_محدد"].sum())
+    doubtful = int((my_squad["حالة_التوفر"] == "🟡 مشكوك بمشاركته").sum())
+    if unavailable:
+        weaknesses.append(f"لديك {unavailable} لاعب غير متاح حاليًا، وهذا خطر مباشر على الـXI.")
+    if long_absent:
+        weaknesses.append(f"لديك {long_absent} لاعب بحالة غياب طويل/غير محدد؛ لا نعتمد عليه في التشكيلة المثالية.")
+    if doubtful:
+        weaknesses.append(f"لديك {doubtful} لاعب/لاعبين مشكوك بمشاركتهم؛ راجع الأخبار قبل الموعد النهائي.")
     if my_squad["احتمال_البداية_والتواجد"].mean() < .75:
         weaknesses.append("احتمال المشاركة في الفريق أقل من المطلوب.")
     if my_squad["قوة_المباريات"].mean() < .45:
@@ -1041,6 +1109,19 @@ with tabs[1]:
         c3.metric("متوسط التواجد", f"{my_squad['احتمال_البداية_والتواجد'].mean()*100:.0f}%")
         c4.metric("مخاطرة القرار", f"{my_squad['مخاطرة_القرار'].mean():.0f}/100")
 
+        unavailable_now = my_squad[my_squad["حالة_التوفر"] == "🔴 غير متاح"]
+        doubtful_now = my_squad[my_squad["حالة_التوفر"] == "🟡 مشكوك بمشاركته"]
+        if not unavailable_now.empty:
+            st.error("🚨 **تنبيه توفر:** " + "، ".join(unavailable_now["web_name"].astype(str).tolist()) + " غير متاحين حاليًا، لذلك لا أعتمد عليهم في التشكيلة المثالية.")
+        if not doubtful_now.empty:
+            st.warning("🟡 **مشاركون غير مضمونين:** " + "، ".join(doubtful_now["web_name"].astype(str).tolist()) + " — راجع الأخبار قبل الموعد النهائي.")
+
+        st.markdown("### 🩺 حالة اللاعبين الصحية/التوفر")
+        availability_table = my_squad[["web_name","team_name","حالة_التوفر","نسبة_التواجد_القادمة","غياب_طويل_أو_غير_محدد","news"]].copy()
+        availability_table["نسبة_التواجد_القادمة"] = (availability_table["نسبة_التواجد_القادمة"]*100).round(0).astype(int)
+        availability_table.columns = ["اللاعب","الفريق","الحالة","احتمال التواجد القادم %","غياب طويل/غير محدد","ملاحظة FPL"]
+        st.dataframe(availability_table, use_container_width=True, hide_index=True)
+
         st.markdown('<div class="pitch">', unsafe_allow_html=True)
         st.markdown(f'<div class="pitch-title">🏟️ تشكيلتك — {formation}</div>', unsafe_allow_html=True)
         for title, typ in [("🧤 حراسة",1),("🛡️ دفاع",2),("🎯 وسط",3),("⚡ هجوم",4)]:
@@ -1156,6 +1237,13 @@ with tabs[2]:
     cols[3].metric("تاريخي", f"{p.hist_ppg:.2f}")
     cols[4].metric("مخاطرة القرار", f"{p.مخاطرة_القرار:.0f}/100")
 
+    if p["حالة_التوفر"] == "🔴 غير متاح" or bool(p["غياب_طويل_أو_غير_محدد"]):
+        st.error(f"🚨 {p.web_name}: {p.حالة_التوفر}. لا يدخل التشكيلة المثالية حاليًا.")
+    elif p["حالة_التوفر"] == "🟡 مشكوك بمشاركته":
+        st.warning(f"🟡 {p.web_name}: المشاركة غير مضمونة. الاحتمال الحالي {p.نسبة_التواجد_القادمة*100:.0f}%.")
+    else:
+        st.success(f"🟢 {p.web_name}: متاح مبدئيًا للمباراة القادمة.")
+
     st.markdown(f"""
     <div class="card">
     <h3>{html.escape(str(p.web_name))} — {html.escape(str(p.team_name))}</h3>
@@ -1222,17 +1310,17 @@ with tabs[3]:
             "النقاط المتوقعة","الفورمة","xGI","آخر 5 متوسط",
             "آخر 10 متوسط","المتوسط التاريخي","الدقائق",
             "البدايات","احتمال التواجد","قوة المباريات",
-            "مخاطرة القرار","DGW"
+            "مخاطرة القرار","حالة التوفر","DGW"
         ],
         a: [
             pa.النقاط_المتوقعة,pa.form,pa.expected_goal_involvements,pa.آخر5_متوسط,
             pa.آخر10_متوسط,pa.hist_ppg,pa.minutes,pa.starts,
-            pa.احتمال_البداية_والتواجد*100,pa.قوة_المباريات,pa.مخاطرة_القرار,pa.عدد_DGW
+            pa.احتمال_البداية_والتواجد*100,pa.قوة_المباريات,pa.مخاطرة_القرار,pa.حالة_التوفر,pa.عدد_DGW
         ],
         b: [
             pb.النقاط_المتوقعة,pb.form,pb.expected_goal_involvements,pb.آخر5_متوسط,
             pb.آخر10_متوسط,pb.hist_ppg,pb.minutes,pb.starts,
-            pb.احتمال_البداية_والتواجد*100,pb.قوة_المباريات,pb.مخاطرة_القرار,pb.عدد_DGW
+            pb.احتمال_البداية_والتواجد*100,pb.قوة_المباريات,pb.مخاطرة_القرار,pb.حالة_التوفر,pb.عدد_DGW
         ]
     })
     st.dataframe(comparison, use_container_width=True, hide_index=True)
@@ -1337,14 +1425,14 @@ with tabs[7]:
         show=df[["web_name","team_name","توقع_ML","النقاط_المتوقعة","مخاطرة_القرار"]].copy().sort_values("توقع_ML",ascending=False).head(25)
         show.columns=["اللاعب","الفريق","توقع ML","توقع Laithinho","مخاطرة القرار"]
         st.dataframe(show,use_container_width=True)
-        st.info("في بداية الموسم لا نعتمد على Last 5/10 كأنها موجودة؛ GW1 تدخل كبيانات حديثة، والتاريخ السابق يعوّض قلة العينة.")
+        st.info("في بداية الموسم لا نعتمد على Last 5/10 كأنها موجودة؛ GW1 تدخل كبيانات حديثة، والتاريخ السابق يعوّض قلة العينة. طبقة التوفر تستبعد المصاب/الموقوف/غير المتاح من التشكيلة المثالية.")
     else:
         st.warning("لم تتوفر بيانات تاريخية كافية لتدريب النموذج. سيستمر المحرك التقليدي بالعمل.")
 
 # ------------------------------------------------------------
 # تبويب المحادثة
 # ------------------------------------------------------------
-with tabs[7]:
+with tabs[8]:
     st.subheader("💬 تحدث مع Laithinho")
 
     if "chat" not in st.session_state:
@@ -1386,6 +1474,6 @@ with tabs[7]:
         st.rerun()
 
 st.caption(
-    "Laithinho V5 حاليًا Data-driven. المرحلة التالية المقترحة: تدريب ML تاريخي على بيانات Gameweek "
-    "مع Backtesting، ثم دمج احتمالية البداية والأخبار في النموذج."
+    "Laithinho V6: ML + تاريخ المواسم + GW الحالية + المباريات + طبقة توفر اللاعب. "
+    "اللاعب غير المتاح/الغائب طويلًا لا يدخل التشكيلة المثالية، لكنه يبقى ظاهرًا في تحليل فريقك."
 )
