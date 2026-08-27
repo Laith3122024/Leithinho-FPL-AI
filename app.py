@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-Laithinho FPL AI V6.4 — Match Brain
+Laithinho FPL AI V6.5.2 — Strategy Engine
 نسخة عربية متكاملة — إصلاح أخطاء البيانات التاريخية:
 - بيانات FPL الحالية
 - آخر الجولات
@@ -1196,11 +1196,27 @@ def build_strategy_squad(budget, strategy="safe", exclude_ids=None):
 
     مهم: الملكية لا تغيّر النقاط المتوقعة نفسها؛ هي طبقة قرار استراتيجية فقط.
     """
-    d = df[(df["price"] > 0)].copy()
+    required = [
+        "price", "حالة_التوفر", "غياب_طويل_أو_غير_محدد", "id",
+        "احتمال_البداية_والتواجد", "ملكية_اللاعب", "درجة_الديفرنتشال",
+        "قوة_المباريات", "سقف_النقاط_التقديري", "النقاط_المتوقعة",
+        "element_type", "team"
+    ]
+    if any(c not in df.columns for c in required):
+        return pd.DataFrame()
+
+    d = df[(pd.to_numeric(df["price"], errors="coerce") > 0)].copy()
+    d["price"] = pd.to_numeric(d["price"], errors="coerce").fillna(0.0)
     d = d[~((d["حالة_التوفر"] == "🔴 غير متاح") | (d["غياب_طويل_أو_غير_محدد"] == True))]
 
     if exclude_ids:
         d = d[~d["id"].isin(list(exclude_ids))]
+
+    for c in [
+        "احتمال_البداية_والتواجد", "ملكية_اللاعب", "درجة_الديفرنتشال",
+        "قوة_المباريات", "سقف_النقاط_التقديري", "النقاط_المتوقعة"
+    ]:
+        d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0)
 
     starter = d["احتمال_البداية_والتواجد"].clip(0, 1)
     own = d["ملكية_اللاعب"].clip(0, 100) / 100.0
@@ -1303,16 +1319,22 @@ def strategy_summary(team, xi):
 # ============================================================
 # ثلاث استراتيجيات: Safe / Balanced / Differential
 # ============================================================
-def _safe_build_strategy(budget_value, strategy_name):
+def safe_build_strategy(budget_value, strategy_name):
+    """غلاف آمن لمحرك التشكيلات.
+    يمنع أي خطأ داخل استراتيجية واحدة من إسقاط التطبيق كاملًا.
+    """
     try:
-        result = build_strategy_squad(budget_value, strategy_name)
-        return result if isinstance(result, pd.DataFrame) else pd.DataFrame()
+        result = build_strategy_squad(float(budget_value), str(strategy_name))
+        if isinstance(result, pd.DataFrame):
+            return result.copy()
     except Exception:
-        return pd.DataFrame()
+        # لا نعرض traceback للمستخدم، لكن نُبقي التطبيق قابلًا للتشغيل.
+        pass
+    return pd.DataFrame()
 
-safe_squad = _safe_build_strategy(budget, "safe")
-balanced_squad = _safe_build_strategy(budget, "balanced")
-differential_squad = _safe_build_strategy(budget, "differential")
+safe_squad = safe_build_strategy(budget, "safe")
+balanced_squad = safe_build_strategy(budget, "balanced")
+differential_squad = safe_build_strategy(budget, "differential")
 
 safe_xi = best_xi(safe_squad)
 balanced_xi = best_xi(balanced_squad)
