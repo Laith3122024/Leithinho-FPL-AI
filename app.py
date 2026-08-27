@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-Laithinho FPL AI V6.0
+Laithinho FPL AI V6.2
 نسخة عربية متكاملة — إصلاح أخطاء البيانات التاريخية:
 - بيانات FPL الحالية
 - آخر الجولات
@@ -24,6 +24,7 @@ Laithinho FPL AI V6.0
 import html
 from io import BytesIO
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -146,14 +147,19 @@ except Exception as exc:
 # ============================================================
 @st.cache_data(ttl=21600)
 def load_history():
-    frames = []
-    for season, url in HIST_URLS.items():
+    # تحميل الموسمين بالتوازي لتقليل وقت الإقلاع الأول للتطبيق.
+    def fetch(item):
+        season, url = item
         try:
             h = get_historical_csv(url)
             h["الموسم"] = season
-            frames.append(h)
+            return h
         except Exception:
-            pass
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        frames = [x for x in pool.map(fetch, HIST_URLS.items()) if x is not None]
+
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
@@ -203,6 +209,200 @@ def dgw_count(tid, horizon=8):
     for f in fs:
         counts[f["gw"]] = counts.get(f["gw"], 0) + 1
     return sum(v >= 2 for v in counts.values())
+
+# ============================================================
+# V6.3 — محرك المباراة القادمة
+# ============================================================
+# الفكرة الأساسية: قبل أن نتوقع نقاط اللاعب، نتوقع المباراة نفسها.
+# نستخدم قوة الفريق الرسمية في FPL + Home/Away + FDR، ثم نحوّلها إلى
+# تقدير أهداف متوقعة واحتمالات فوز/تعادل/خسارة وClean Sheet.
+# هذه طبقة مستقلة عن ML حتى لا يصبح النموذج أسير متوسطات اللاعب.
+
+def _team_strength_row(tid):
+    z = teams_df[teams_df["id"] == int(tid)]
+    return z.iloc[0] if not z.empty else pd.Series(dtype=object)
+
+def _strength(row, key, fallback=1000.0):
+    try:
+        v = float(row.get(key, fallback))
+        return v if np.isfinite(v) and v > 0 else fallback
+    except Exception:
+        return fallback
+
+@st.cache_data(ttl=1800)
+def build_match_predictions(_fixtures, _teams_df, _team_names, gw):
+    # المتوسطات الافتراضية للدوري تُستخدم فقط كمرساة، ثم نعدلها بقوة الفرق.
+    league_goal = 1.45
+    rows = []
+    future = _fixtures[_fixtures["event"].notna()].copy() if "event" in _fixtures.columns else pd.DataFrame()
+    if future.empty:
+        return pd.DataFrame()
+    future["event"] = pd.to_numeric(future["event"], errors="coerce")
+    future = future[future["event"] >= int(gw)].copy()
+    if future.empty:
+        return pd.DataFrame()
+
+    for _, fx in future.sort_values("event").iterrows():
+        th, ta = int(fx["team_h"]), int(fx["team_a"])
+        rh, ra = _team_strength_row(th), _team_strength_row(ta)
+        # FPL strength_* fields are scaled ratings. We use the correct home/away
+        # attack and defence fields when available.
+        ah = _strength(rh, "strength_attack_home", _strength(rh, "strength", 1000))
+        da = _strength(rh, "strength_defence_home", _strength(rh, "strength", 1000))
+        aa = _strength(ra, "strength_attack_away", _strength(ra, "strength", 1000))
+        dh = _strength(ra, "strength_defence_away", _strength(ra, "strength", 1000))
+
+        # Convert ratings into relative attack/defence multipliers. Clamp to avoid
+        # absurd early-season predictions when only one GW exists.
+        att_h = np.clip(ah / 1100.0, .55, 1.75)
+        att_a = np.clip(aa / 1100.0, .55, 1.75)
+        def_h = np.clip(da / 1100.0, .55, 1.75)
+        def_a = np.clip(dh / 1100.0, .55, 1.75)
+
+        xg_h = league_goal * att_h * (2.0 / (1.0 + def_a)) * 1.08
+        xg_a = league_goal * att_a * (2.0 / (1.0 + def_h)) * .92
+        xg_h = float(np.clip(xg_h, .20, 3.80))
+        xg_a = float(np.clip(xg_a, .15, 3.20))
+
+        # FDR is an explicit opponent-strength signal.
+        fdr_h = float(fx.get("team_h_difficulty", 3) or 3)
+        fdr_a = float(fx.get("team_a_difficulty", 3) or 3)
+        xg_h *= float(np.clip(1.08 - .055 * (fdr_h - 3), .82, 1.18))
+        xg_a *= float(np.clip(1.08 - .055 * (fdr_a - 3), .82, 1.18))
+
+        total = xg_h + xg_a
+        p_h_win = float(np.clip(.50 + .16 * (xg_h - xg_a), .08, .90))
+        p_a_win = float(np.clip(.50 + .16 * (xg_a - xg_h), .08, .90))
+        p_draw = float(np.clip(1.0 - p_h_win - p_a_win + .18, .08, .38))
+        norm = p_h_win + p_a_win + p_draw
+        p_h_win, p_a_win, p_draw = p_h_win/norm, p_a_win/norm, p_draw/norm
+
+        cs_h = float(np.exp(-xg_a))
+        cs_a = float(np.exp(-xg_h))
+        over25 = float(1 - np.exp(-total) * (1 + total + (total**2)/2))
+        h_2plus = float(1 - np.exp(-xg_h) * (1 + xg_h))
+        a_2plus = float(1 - np.exp(-xg_a) * (1 + xg_a))
+
+        rows.append({
+            "gw": int(fx["event"]), "fixture_id": int(fx.get("id", -1)),
+            "home_id": th, "away_id": ta,
+            "home": _team_names.get(th, "?"), "away": _team_names.get(ta, "?"),
+            "xg_home": xg_h, "xg_away": xg_a,
+            "home_win": p_h_win, "draw": p_draw, "away_win": p_a_win,
+            "cs_home": cs_h, "cs_away": cs_a,
+            "home_2plus": h_2plus, "away_2plus": a_2plus,
+            "over_2_5": over25,
+            "fdr_home": fdr_h, "fdr_away": fdr_a,
+        })
+    return pd.DataFrame(rows)
+
+match_predictions = build_match_predictions(fixtures, teams_df, team_names, current_gw)
+
+def next_match(tid):
+    if match_predictions.empty:
+        return None
+    x = match_predictions[(match_predictions["home_id"] == int(tid)) | (match_predictions["away_id"] == int(tid))]
+    return x.sort_values("gw").iloc[0] if not x.empty else None
+
+def fixture_label_for_player(row):
+    m = next_match(int(row["team"]))
+    if m is None:
+        return pd.Series({
+            "المباراة_القادمة": "غير متوفرة", "المباراة_القادمة_المكان": "—",
+            "أهداف_الفريق_المتوقعة": 0.0, "احتمال_الفوز": 0.0,
+            "احتمال_كلين_شيت": 0.0, "احتمال_الفريق_يسجل_هدفين": 0.0,
+            "قوة_المواجهة": .5, "ملخص_المباراة": "لا توجد مباراة قادمة متاحة."
+        })
+    home_side = int(m["home_id"]) == int(row["team"])
+    opp = m["away"] if home_side else m["home"]
+    team_xg = m["xg_home"] if home_side else m["xg_away"]
+    win = m["home_win"] if home_side else m["away_win"]
+    cs = m["cs_home"] if home_side else m["cs_away"]
+    two = m["home_2plus"] if home_side else m["away_2plus"]
+    fdr = m["fdr_home"] if home_side else m["fdr_away"]
+    venue = "داخل الأرض 🏠" if home_side else "خارج الأرض ✈️"
+    # Higher is better: easy FDR + home boost + expected team goals.
+    match_score = float(np.clip(.55 * ((5-fdr)/4) + .25 * min(team_xg/2.2,1) + .20 * (1 if home_side else .75), 0, 1))
+    return pd.Series({
+        "المباراة_القادمة": f"{row['team_name']} × {opp}",
+        "المباراة_القادمة_المكان": venue,
+        "أهداف_الفريق_المتوقعة": team_xg,
+        "احتمال_الفوز": win, "احتمال_كلين_شيت": cs,
+        "احتمال_الفريق_يسجل_هدفين": two, "قوة_المواجهة": match_score,
+        "ملخص_المباراة": f"{row['team_name']} ضد {opp}: xG الفريق {team_xg:.2f}، فوز {win*100:.0f}%، Clean Sheet {cs*100:.0f}%، {venue}."
+    })
+
+match_cols = df.apply(fixture_label_for_player, axis=1)
+df = pd.concat([df, match_cols], axis=1)
+
+# ============================================================
+# توقع نقاط قائم على المباراة نفسها
+# ============================================================
+def _team_xg_sum(tid):
+    m = match_predictions[(match_predictions["home_id"] == int(tid)) | (match_predictions["away_id"] == int(tid))] if not match_predictions.empty else pd.DataFrame()
+    if m.empty:
+        return 1.45
+    z = m.iloc[0]
+    return float(z["xg_home"] if int(z["home_id"]) == int(tid) else z["xg_away"])
+
+# توزيع xG الفردي من بيانات FPL الحالية؛ إذا لم توجد xG، نستخدم xGI كنقطة
+# انطلاق حتى لا نكسر اللاعبين الجدد.
+def add_match_aware_player_projection(frame):
+    out = frame.copy()
+    team_xg_map = {}
+    team_xg_total = {}
+    for tid in out["team"].dropna().unique():
+        team_xg_map[int(tid)] = _team_xg_sum(int(tid))
+        g = out[out["team"] == tid]
+        team_xg_total[int(tid)] = float(num(g.get("expected_goals", 0)).sum())
+
+    exp_goal = num(out.get("expected_goals", 0))
+    exp_assist = num(out.get("expected_assists", 0))
+    exp_xgi = num(out.get("expected_goal_involvements", 0))
+    team_share = []
+    for idx, r in out.iterrows():
+        tid = int(r["team"])
+        denom = team_xg_total.get(tid, 0.0)
+        if denom > 0 and float(exp_goal.loc[idx]) > 0:
+            share = float(exp_goal.loc[idx] / denom)
+        else:
+            g = out[out["team"] == tid]
+            xgi_total = float(num(g.get("expected_goal_involvements", 0)).sum())
+            share = float(exp_xgi.loc[idx] / xgi_total) if xgi_total > 0 else 0.05
+        team_share.append(float(np.clip(share, 0.01, .45)))
+    out["حصة_أهداف_الفريق"] = team_share
+    out["xG_الجولة_القادمة"] = [team_xg_map.get(int(t), 1.45) * s for t, s in zip(out["team"], out["حصة_أهداف_الفريق"])]
+    out["xA_الجولة_القادمة"] = np.clip(exp_assist * (0.7 + 0.6 * out["قوة_المواجهة"]), 0, 1.2)
+
+    pos = num(out["element_type"])
+    minutes_factor = out["احتمال_البداية_والتواجد"].clip(0,1)
+    cs = out["احتمال_كلين_شيت"].clip(0,1)
+    # FPL scoring expectation approximation: appearance + goals + assists + CS +
+    # a small bonus component. This is intentionally an interpretable layer.
+    appearance = 2.0 * minutes_factor
+    goal_points = np.where(pos == 4, 4.0, np.where(pos == 3, 5.0, np.where(pos == 2, 6.0, 10.0))) * out["xG_الجولة_القادمة"]
+    assist_points = 3.0 * out["xA_الجولة_القادمة"]
+    cs_points = np.where(pos == 2, 4.0, np.where(pos == 3, 1.0, 0.0)) * cs * minutes_factor
+    bonus = .35 * out["مؤشر_الاعتماد_الأساسي"] + .25 * out["bps_n"] + .20 * out["ict_n"]
+    match_raw = appearance + goal_points + assist_points + cs_points + bonus
+
+    # Match-aware blend: the fixture can move the prediction materially, but ML
+    # and historical/current form remain in the decision.
+    out["توقع_المباراة"] = np.clip(match_raw, .2, 18)
+    out["النقاط_المتوقعة_المباراة_الواعية"] = np.clip(
+        .55 * out["توقع_المباراة"] + .30 * out["النقاط_المتوقعة"] + .15 * out["توقع_ML"].fillna(out["النقاط_المتوقعة"]),
+        .2, 18
+    )
+    # Strong match signals can lift ceiling; poor fixtures can lower it.
+    out["سقف_النقاط_التقديري"] = np.clip(
+        out["النقاط_المتوقعة_المباراة_الواعية"] + 4.0 * out["xG_الجولة_القادمة"] + 2.0 * out["xA_الجولة_القادمة"] + 2.0 * out["احتمال_كلين_شيت"] * (pos == 2),
+        .5, 25
+    )
+    return out
+
+# يُعاد حسابه بعد ML حتى يجمع بين ML + المباراة.
+df = add_match_aware_player_projection(df)
+df["النقاط_المتوقعة"] = df["النقاط_المتوقعة_المباراة_الواعية"]
 
 # ============================================================
 # التاريخ لكل لاعب
@@ -322,6 +522,8 @@ def recent_stats():
             "آخر5_نقاط": last5["total_points"].sum(),
             "آخر5_متوسط": last5["total_points"].mean(),
             "آخر5_دقائق": last5["minutes"].sum(),
+            "آخر5_دقائق_متوسط": last5["minutes"].mean(),
+            "آخر5_بدايات": float((last5["minutes"] >= 60).sum()),
             "آخر5_xGI": last5["expected_goal_involvements"].sum(),
             "آخر10_متوسط": g.tail(10)["total_points"].mean(),
         })
@@ -339,12 +541,12 @@ if not recent.empty:
     )
     if "name" in df.columns:
         df = df.drop(columns=["name"])
-    for c in ["آخر5_نقاط","آخر5_متوسط","آخر5_دقائق","آخر5_xGI","آخر10_متوسط"]:
+    for c in ["آخر5_نقاط","آخر5_متوسط","آخر5_دقائق","آخر5_دقائق_متوسط","آخر5_بدايات","آخر5_xGI","آخر10_متوسط"]:
         if c not in df.columns:
             df[c] = 0
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 else:
-    for c in ["آخر5_نقاط","آخر5_متوسط","آخر5_دقائق","آخر5_xGI","آخر10_متوسط"]:
+    for c in ["آخر5_نقاط","آخر5_متوسط","آخر5_دقائق","آخر5_دقائق_متوسط","آخر5_بدايات","آخر5_xGI","آخر10_متوسط"]:
         df[c] = 0
 
 # ============================================================
@@ -405,6 +607,35 @@ def availability_profile(row):
 avail = df.apply(availability_profile, axis=1)
 df = pd.concat([df, avail], axis=1)
 
+# ============================================================
+# اعتماد المدرب على اللاعب / احتمالية أن يكون أساسيًا
+# ============================================================
+# لا نساوي بين لاعب يملك نقاطًا جيدة لكنه حبيس الدكة، ولاعب يعتمد عليه
+# المدرب ويبدأ معظم المباريات. في بداية الموسم نستخدم GW المتاحة فقط،
+# ثم تزداد دقة المؤشر تلقائيًا مع مرور الجولات.
+completed_gws = max(int(current_gw) - 1, 1)
+df["معدل_البدايات_الحالي"] = (df["starts"] / completed_gws).clip(0, 1)
+df["معدل_الدقائق_الحالي"] = (df["minutes"] / (completed_gws * 90.0)).clip(0, 1)
+df["معدل_البدايات_التاريخي"] = (df["hist_starts"] / df["hist_gws"].replace(0, np.nan)).fillna(0).clip(0, 1)
+df["معدل_الدقائق_التاريخي"] = (df["hist_minutes"] / (df["hist_gws"].replace(0, np.nan) * 90.0)).fillna(0).clip(0, 1)
+
+# عند توفر بيانات الموسم الحالي نعطيها الوزن الأكبر. للاعب جديد/منقول
+# بلا دقائق حالية، نستفيد من سجله التاريخي بدل اعتباره لاعب دكة تلقائيًا.
+df["مؤشر_الاعتماد_الأساسي"] = np.where(
+    (df["minutes"] + df["starts"]) > 0,
+    .55 * df["معدل_البدايات_الحالي"] + .25 * df["معدل_الدقائق_الحالي"] + .20 * df["معدل_البدايات_التاريخي"],
+    .70 * df["معدل_البدايات_التاريخي"] + .30 * df["معدل_الدقائق_التاريخي"]
+).clip(0, 1)
+
+# إشارات إضافية من آخر 5 جولات تاريخية عندما تكون متاحة.
+recent_start_rate = (df["آخر5_بدايات"] / 5.0).clip(0, 1)
+recent_min_rate = (df["آخر5_دقائق_متوسط"] / 90.0).clip(0, 1)
+df["مؤشر_الاعتماد_الأساسي"] = np.where(
+    (df["آخر5_بدايات"] + df["آخر5_دقائق_متوسط"]) > 0,
+    .55 * df["مؤشر_الاعتماد_الأساسي"] + .30 * recent_start_rate + .15 * recent_min_rate,
+    df["مؤشر_الاعتماد_الأساسي"]
+).clip(0, 1)
+
 df["قوة_المباريات"] = df["team"].apply(lambda tid: fixture_strength(tid))
 df["عدد_DGW"] = df["team"].apply(lambda tid: dgw_count(tid))
 
@@ -421,7 +652,8 @@ df["الأساس"] = (
     .05 * df["recent10_n"] +
     .06 * df["hist_ppg_n"] +
     .04 * df["hist_xgi_n"] +
-    .07 * df["احتمال_البداية_والتواجد"]
+    .07 * df["احتمال_البداية_والتواجد"] +
+    .10 * df["مؤشر_الاعتماد_الأساسي"]
 )
 
 df["النقاط_المتوقعة"] = (
@@ -453,8 +685,9 @@ df["النقاط_المتوقعة"] += df["عدد_DGW"].clip(0,2) * (
 df["مخاطرة_القرار"] = np.clip(
     100 * (
         .32 * (1 - df["احتمال_البداية_والتواجد"]) +
-        .22 * (1 - df["starts_n"]) +
-        .18 * (1 - df["minutes_n"]) +
+        .12 * (1 - df["starts_n"]) +
+        .12 * (1 - df["minutes_n"]) +
+        .10 * (1 - df["مؤشر_الاعتماد_الأساسي"]) +
         .14 * (1 - df["hist_ppg_n"]) +
         .14 * (1 - df["قوة_المباريات"].clip(0,1)) +
         .20 * df["شدة_الغياب"]
@@ -471,7 +704,7 @@ def risk_label(x):
 
 
 # ============================================================
-# V6.0 — Machine Learning Prediction Engine
+# V6.2 — Machine Learning Prediction Engine
 # ============================================================
 # هذا نموذج ML فعلي: يتعلم من صفوف تاريخية "قبل الجولة" ويتنبأ
 # بالنقاط الفعلية للجولة التالية. لا نستخدم نقاط نفس الجولة كمدخل.
@@ -481,6 +714,7 @@ ML_FEATURES = [
     "ml_prev_goals", "ml_prev_assists", "ml_prev_xgi",
     "ml_prev_bonus", "ml_prev_bps", "ml_prev_ict",
     "ml_season_ppg", "ml_price", "ml_position", "ml_home",
+    "ml_start_rate", "ml_minutes_rate",
 ]
 
 def _first_existing(frame, names, default=0):
@@ -549,6 +783,10 @@ def build_ml_training_data(history_df):
     h["ml_roll5_minutes"] = h["ml_prev_minutes"].groupby(
         [h[k] for k in group_keys], sort=False
     ).transform(lambda s: s.rolling(5, min_periods=1).mean())
+
+    # معدل البداية/الدقائق قبل المباراة: أهم إشارة على اعتماد المدرب.
+    h["ml_start_rate"] = (h["ml_prev_starts"] / h["GW"].clip(lower=1)).clip(0, 1)
+    h["ml_minutes_rate"] = (h["ml_prev_minutes"] / (h["GW"].clip(lower=1) * 90.0)).clip(0, 1)
 
     h["ml_season_ppg"] = h["__ppg"].shift(1).fillna(0)
     h["ml_price"] = h["__price"].shift(1).fillna(0)
@@ -635,6 +873,9 @@ def make_current_ml_features(frame):
     out["ml_price"] = num(frame.get("price", 0))
     out["ml_position"] = num(frame.get("element_type", 0))
     out["ml_home"] = 0.0
+    completed = max(int(current_gw) - 1, 1)
+    out["ml_start_rate"] = (num(frame.get("starts", 0)) / completed).clip(0, 1)
+    out["ml_minutes_rate"] = (num(frame.get("minutes", 0)) / (completed * 90.0)).clip(0, 1)
 
     # Next fixture: home/away is known before kickoff and is safe to use.
     for i, (_, row) in enumerate(frame.iterrows()):
@@ -663,6 +904,10 @@ if ml_bundle is not None:
     df["النقاط_المتوقعة"] *= (
         .05 + .95 * df["احتمال_البداية_والتواجد"].clip(0,1)
     )
+    # اعتماد المدرب يدخل في التوقع النهائي، لكن بشكل تدريجي حتى لا نعاقب
+    # لاعبًا جديدًا بعدد جولات قليل أو انتقالًا حديثًا.
+    starter_factor = (0.72 + 0.28 * df["مؤشر_الاعتماد_الأساسي"].clip(0,1))
+    df["النقاط_المتوقعة"] *= starter_factor
     df.loc[df["غياب_طويل_أو_غير_محدد"], "النقاط_المتوقعة"] *= 0.15
 else:
     df["توقع_ML"] = np.nan
@@ -933,6 +1178,20 @@ xi = best_xi(squad)
 with tabs[0]:
     st.subheader(f"🏟️ تشكيلة Laithinho المقترحة — الجولة {current_gw}")
 
+    st.markdown("### 🗓️ تحليل المباريات القادمة")
+    if not match_predictions.empty:
+        mp = match_predictions[match_predictions["gw"] == int(current_gw)].copy()
+        if mp.empty:
+            mp = match_predictions.head(10).copy()
+        mp["المباراة"] = mp["home"] + " 🆚 " + mp["away"]
+        mp["التوقع"] = mp["xg_home"].round(2).astype(str) + " - " + mp["xg_away"].round(2).astype(str)
+        mp["فوز صاحب الأرض"] = (mp["home_win"]*100).round(0).astype(int).astype(str) + "%"
+        mp["كلين شيت صاحب الأرض"] = (mp["cs_home"]*100).round(0).astype(int).astype(str) + "%"
+        mp["كلين شيت الضيف"] = (mp["cs_away"]*100).round(0).astype(int).astype(str) + "%"
+        st.dataframe(mp[["المباراة","التوقع","فوز صاحب الأرض","كلين شيت صاحب الأرض","كلين شيت الضيف"]], use_container_width=True, hide_index=True)
+    else:
+        st.info("لا توجد مباريات قادمة متاحة حاليًا من مصدر FPL.")
+
     if xi.empty:
         st.error("لم أستطع بناء تشكيلة بهذه الميزانية.")
     else:
@@ -975,8 +1234,8 @@ with tabs[0]:
 
         st.markdown("### 🧠 لماذا هذه التشكيلة؟")
         st.write(
-            "الاختيار يجمع بين الإنتاج الحالي، آخر 5 و10 جولات، "
-            "السجل التاريخي، الدقائق والبدايات، احتمالية المشاركة، جودة المباريات وDGW."
+            "الاختيار يجمع بين توقع المباراة القادمة، xG الفريق، Clean Sheet، Home/Away، "
+            "الإنتاج الحالي، آخر 5 و10 جولات، السجل التاريخي، الدقائق والبدايات، احتمالية المشاركة وDGW."
         )
 
 # ------------------------------------------------------------
@@ -1237,6 +1496,17 @@ with tabs[2]:
     cols[3].metric("تاريخي", f"{p.hist_ppg:.2f}")
     cols[4].metric("مخاطرة القرار", f"{p.مخاطرة_القرار:.0f}/100")
 
+    st.markdown("### 🆚 المباراة القادمة — قلب التوقع")
+    st.info(
+        f"**{p['المباراة_القادمة']}** — {p['المباراة_القادمة_المكان']}\n\n"
+        f"أهداف الفريق المتوقعة: **{p['أهداف_الفريق_المتوقعة']:.2f}** | "
+        f"احتمال الفوز: **{p['احتمال_الفوز']*100:.0f}%** | "
+        f"احتمال Clean Sheet: **{p['احتمال_كلين_شيت']*100:.0f}%** | "
+        f"احتمال تسجيل هدفين+: **{p['احتمال_الفريق_يسجل_هدفين']*100:.0f}%**"
+    )
+    st.metric("التوقع بعد فهم المباراة", f"{p['النقاط_المتوقعة']:.2f}")
+    st.caption(f"توقع المباراة وحده: {p['توقع_المباراة']:.2f} | سقف تقديري: {p['سقف_النقاط_التقديري']:.1f}")
+
     if p["حالة_التوفر"] == "🔴 غير متاح" or bool(p["غياب_طويل_أو_غير_محدد"]):
         st.error(f"🚨 {p.web_name}: {p.حالة_التوفر}. لا يدخل التشكيلة المثالية حاليًا.")
     elif p["حالة_التوفر"] == "🟡 مشكوك بمشاركته":
@@ -1415,7 +1685,7 @@ with tabs[6]:
 # تبويب Machine Learning
 # ------------------------------------------------------------
 with tabs[7]:
-    st.subheader("🤖 محرك التوقعات ML — V6.0")
+    st.subheader("🤖 محرك التوقعات ML — V6.2")
     if ml_info.get("trained"):
         a,b,c=st.columns(3)
         a.metric("حالات التدريب", f"{ml_info['rows']:,}")
@@ -1474,6 +1744,6 @@ with tabs[8]:
         st.rerun()
 
 st.caption(
-    "Laithinho V6: ML + تاريخ المواسم + GW الحالية + المباريات + طبقة توفر اللاعب. "
+    "Laithinho V6.2: ML + تاريخ المواسم + GW الحالية + المباريات + توفر اللاعب + اعتماد المدرب + تسريع التحميل. "
     "اللاعب غير المتاح/الغائب طويلًا لا يدخل التشكيلة المثالية، لكنه يبقى ظاهرًا في تحليل فريقك."
 )
