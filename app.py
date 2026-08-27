@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-Laithinho FPL AI V6.3
+Laithinho FPL AI V6.3.1
 نسخة عربية متكاملة — إصلاح أخطاء البيانات التاريخية:
 - بيانات FPL الحالية
 - آخر الجولات
@@ -798,7 +798,7 @@ def build_ml_training_data(history_df):
     return h[ML_FEATURES + ["total_points", "الموسم", "GW", "name"]].copy()
 
 @st.cache_resource(ttl=21600)
-def train_ml_model(history_df):
+def train_ml_model_v2(history_df):
     train = build_ml_training_data(history_df)
     if train.empty or len(train) < 200:
         return None, {"trained": False, "rows": len(train)}
@@ -813,14 +813,16 @@ def train_ml_model(history_df):
         train_part = train[train["GW"] <= cutoff].copy()
         valid_part = train[train["GW"] > cutoff].copy()
 
-    X_train = train_part[ML_FEATURES]
-    y_train = train_part["total_points"]
-    X_valid = valid_part[ML_FEATURES]
-    y_valid = valid_part["total_points"]
+    # نستخدم مصفوفات NumPy داخل الـImputer حتى لا تتسبب أسماء أعمدة
+    # DataFrame القديمة/المخزنة مؤقتًا في خطأ feature names/order.
+    X_train = train_part.loc[:, ML_FEATURES].apply(pd.to_numeric, errors="coerce")
+    y_train = pd.to_numeric(train_part["total_points"], errors="coerce").fillna(0)
+    X_valid = valid_part.loc[:, ML_FEATURES].apply(pd.to_numeric, errors="coerce")
+    y_valid = pd.to_numeric(valid_part["total_points"], errors="coerce").fillna(0)
 
     imputer = SimpleImputer(strategy="median")
-    X_train_i = imputer.fit_transform(X_train)
-    X_valid_i = imputer.transform(X_valid)
+    X_train_i = imputer.fit_transform(X_train.to_numpy(dtype=float))
+    X_valid_i = imputer.transform(X_valid.to_numpy(dtype=float))
 
     model = HistGradientBoostingRegressor(
         max_iter=250,
@@ -834,7 +836,10 @@ def train_ml_model(history_df):
     mae = mean_absolute_error(y_valid, model.predict(X_valid_i)) if len(valid_part) else None
 
     # Final production model learns from ALL historical rows.
-    X_all = imputer.fit_transform(train[ML_FEATURES])
+    # إعادة fit للـimputer على كامل البيانات ثم إرجاع نفس النسخة
+    # المستخدمة في تحويل بيانات اللاعبين الحالية.
+    X_all_df = train.loc[:, ML_FEATURES].apply(pd.to_numeric, errors="coerce")
+    X_all = imputer.fit_transform(X_all_df.to_numpy(dtype=float))
     final_model = HistGradientBoostingRegressor(
         max_iter=300,
         learning_rate=0.04,
@@ -884,12 +889,34 @@ def make_current_ml_features(frame):
     return out[ML_FEATURES]
 
 with st.spinner("جاري تدريب محرك التوقعات ML على المواسم السابقة..."):
-    ml_bundle, ml_info = train_ml_model(history)
+    ml_bundle, ml_info = train_ml_model_v2(history)
 
 if ml_bundle is not None:
     ml_model, ml_imputer = ml_bundle
     ml_features_now = make_current_ml_features(df)
-    ml_pred = ml_model.predict(ml_imputer.transform(ml_features_now))
+
+    # حماية من اختلاف ترتيب/أسماء الأعمدة بين جلسات Streamlit أو الـcache.
+    # الـML يتعامل داخليًا مع نفس ML_FEATURES وبمصفوفة رقمية ثابتة.
+    try:
+        ml_input = (
+            ml_features_now
+            .reindex(columns=ML_FEATURES)
+            .apply(pd.to_numeric, errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .to_numpy(dtype=float)
+        )
+        if ml_input.shape[1] != len(ML_FEATURES):
+            raise ValueError(
+                f"عدد خصائص ML غير صحيح: {ml_input.shape[1]} بدل {len(ML_FEATURES)}"
+            )
+        ml_pred = ml_model.predict(ml_imputer.transform(ml_input))
+    except Exception as ml_exc:
+        # لا نسقط التطبيق كله إذا تعطل ML؛ نرجع لمحرك النقاط الحتمي.
+        ml_pred = np.asarray(df["النقاط_المتوقعة"], dtype=float)
+        ml_info = dict(ml_info)
+        ml_info["runtime_fallback"] = True
+        ml_info["runtime_error"] = str(ml_exc)
+
     # Blend ML with the deterministic engine rather than blindly trusting one model.
     df["توقع_ML"] = np.clip(ml_pred, 0.0, 15.0)
     df["النقاط_المتوقعة_قبل_ML"] = df["النقاط_المتوقعة"]
