@@ -1187,7 +1187,7 @@ df = pd.concat([df, ownership], axis=1)
 # ============================================================
 # تحسين الفريق
 # ============================================================
-def optimize_squad(budget, strategy="safe", exclude_ids=None):
+def build_strategy_squad(budget, strategy="safe", exclude_ids=None):
     """بناء فريق كامل حسب استراتيجية FPL مختلفة.
 
     safe      = أعلى استقرار + ملكية عالية + احتمال بداية قوي.
@@ -1303,9 +1303,16 @@ def strategy_summary(team, xi):
 # ============================================================
 # ثلاث استراتيجيات: Safe / Balanced / Differential
 # ============================================================
-safe_squad = optimize_squad(budget, "safe")
-balanced_squad = optimize_squad(budget, "balanced")
-differential_squad = optimize_squad(budget, "differential")
+def _safe_build_strategy(budget_value, strategy_name):
+    try:
+        result = build_strategy_squad(budget_value, strategy_name)
+        return result if isinstance(result, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+safe_squad = _safe_build_strategy(budget, "safe")
+balanced_squad = _safe_build_strategy(budget, "balanced")
+differential_squad = _safe_build_strategy(budget, "differential")
 
 safe_xi = best_xi(safe_squad)
 balanced_xi = best_xi(balanced_squad)
@@ -1529,9 +1536,6 @@ tabs = st.tabs([
     "🤖 توقع ML",
     "💬 Laithinho"
 ])
-
-squad = optimize_squad(budget)
-xi = best_xi(squad)
 
 
 # ------------------------------------------------------------
