@@ -296,20 +296,44 @@ def build_match_predictions(_fixtures, _teams_df, _team_names, gw):
         "ah": "strength_attack_home", "aa": "strength_attack_away",
         "dh": "strength_defence_home", "da": "strength_defence_away"
     }
+    # احسب الوسيط فقط من القيم الموجبة والصحيحة.
+    # بعض نسخ/حالات FPL قد ترجع 0 أو NaN لقوة فريق، والـmedian=0
+    # كان يسبب ZeroDivisionError عند التطبيع لاحقًا.
     med = {}
     for k, c in cols.items():
-        vals = pd.to_numeric(_teams_df[c], errors="coerce") if c in _teams_df.columns else pd.Series(dtype=float)
-        med[k] = float(vals.replace([np.inf,-np.inf], np.nan).dropna().median()) if not vals.dropna().empty else 1100.0
+        if c in _teams_df.columns:
+            vals = pd.to_numeric(_teams_df[c], errors="coerce")
+            vals = vals.replace([np.inf, -np.inf], np.nan)
+            vals = vals[vals > 0].dropna()
+            med[k] = float(vals.median()) if not vals.empty else 1100.0
+        else:
+            med[k] = 1100.0
+        if not np.isfinite(med[k]) or med[k] <= 0:
+            med[k] = 1100.0
 
     def rating(tid, key):
         r = _teams_df[_teams_df["id"] == int(tid)]
-        if r.empty: return med[key]
+        if r.empty:
+            return med[key]
         c = cols[key]
         try:
-            v=float(r.iloc[0].get(c, med[key]))
-            return v if np.isfinite(v) and v>0 else med[key]
+            v = float(r.iloc[0].get(c, med[key]))
+            return v if np.isfinite(v) and v > 0 else med[key]
         except Exception:
             return med[key]
+
+    def safe_ratio(value, denominator, default=1.0):
+        """نسبة آمنة تمنع أي قسمة على صفر أو قيم غير صالحة."""
+        try:
+            value = float(value)
+            denominator = float(denominator)
+            if not np.isfinite(value) or value <= 0:
+                return default
+            if not np.isfinite(denominator) or denominator <= 0:
+                return default
+            return value / denominator
+        except Exception:
+            return default
 
     def poisson_zero(lam): return float(np.exp(-max(lam, 0)))
     def poisson_two_plus(lam): return float(1 - np.exp(-lam)*(1+lam))
@@ -318,17 +342,19 @@ def build_match_predictions(_fixtures, _teams_df, _team_names, gw):
         th, ta = int(fx["team_h"]), int(fx["team_a"])
         # Attack/defence are normalized to the league median, avoiding the old
         # arbitrary 1100 denominator and making team differences comparable.
-        ah = np.clip(rating(th,"ah")/med["ah"], .65, 1.55)
-        aa = np.clip(rating(ta,"aa")/med["aa"], .65, 1.55)
-        dh = np.clip(rating(th,"dh")/med["dh"], .65, 1.55)
-        da = np.clip(rating(ta,"da")/med["da"], .65, 1.55)
+        ah = np.clip(safe_ratio(rating(th, "ah"), med["ah"]), .65, 1.55)
+        aa = np.clip(safe_ratio(rating(ta, "aa"), med["aa"]), .65, 1.55)
+        dh = np.clip(safe_ratio(rating(th, "dh"), med["dh"]), .65, 1.55)
+        da = np.clip(safe_ratio(rating(ta, "da"), med["da"]), .65, 1.55)
         fdr_h = float(pd.to_numeric(pd.Series([fx.get("team_h_difficulty",3)]), errors="coerce").fillna(3).iloc[0])
         fdr_a = float(pd.to_numeric(pd.Series([fx.get("team_a_difficulty",3)]), errors="coerce").fillna(3).iloc[0])
         # FDR is deliberately a secondary correction, not the entire model.
         fdr_mod_h = np.clip(1.0 + 0.065*(3-fdr_h), .82, 1.18)
         fdr_mod_a = np.clip(1.0 + 0.065*(3-fdr_a), .82, 1.18)
-        xg_h = league_home * ah * (1.0/dh) * fdr_mod_h
-        xg_a = league_away * aa * (1.0/da) * fdr_mod_a
+        dh_safe = max(float(dh), 0.01)
+        da_safe = max(float(da), 0.01)
+        xg_h = league_home * ah * (1.0/dh_safe) * fdr_mod_h
+        xg_a = league_away * aa * (1.0/da_safe) * fdr_mod_a
         xg_h = float(np.clip(xg_h, .25, 3.8)); xg_a = float(np.clip(xg_a, .15, 3.2))
 
         # Convert xG to win/CS/scoring probabilities using Poisson.
@@ -345,7 +371,11 @@ def build_match_predictions(_fixtures, _teams_df, _team_names, gw):
                 elif gh==ga: p_dr+=q
                 else: p_aw+=q
         z=p_hw+p_dr+p_aw
-        p_hw,p_dr,p_aw=p_hw/z,p_dr/z,p_aw/z
+        # شبكة النتائج لا ينبغي أن تكون صفرًا، لكن نضع fallback دفاعيًا.
+        if not np.isfinite(z) or z <= 0:
+            p_hw, p_dr, p_aw = 1/3, 1/3, 1/3
+        else:
+            p_hw, p_dr, p_aw = p_hw/z, p_dr/z, p_aw/z
         total=xg_h+xg_a
         rows.append({
             "gw":int(fx["event"]), "fixture_id":int(fx.get("id",-1)),
